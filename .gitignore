@@ -1,0 +1,14 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Disk images are build artifacts
+*.img
+
+# macOS
+.DS_Store
+
+# Editors / tooling
+.idea/
+.vscode/
+.claude/
