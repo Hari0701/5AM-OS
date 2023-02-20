@@ -1,0 +1,6 @@
+# Deliberately NOT setting `build.target` here.
+#
+# This workspace compiles for two machines: kernel/ for bare metal and boot/ for
+# your Mac. A global default target would force both, and the builder crate
+# would fail to compile for a machine with no OS. Each is passed its target
+# explicitly in run.sh instead.
