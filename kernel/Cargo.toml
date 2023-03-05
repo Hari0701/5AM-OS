@@ -1,0 +1,10 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The handover contract with the bootloader: entry point signature, memory map,
+# framebuffer info. Deliberately the only dependency — everything else in this
+# kernel is written here so it can be read here.
+bootloader_api = "0.11"
