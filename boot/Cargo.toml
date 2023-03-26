@@ -1,0 +1,9 @@
+[package]
+name = "boot"
+version = "0.1.0"
+edition = "2021"
+
+# This one runs on your Mac, not on 5AM-OS. It takes the compiled kernel and
+# wraps it in a bootable disk image.
+[dependencies]
+bootloader = "0.11"
