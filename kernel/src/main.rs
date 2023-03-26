@@ -11,6 +11,7 @@
 #![no_main] // No `main`: there is no runtime to call it. The bootloader jumps
             // straight to the symbol named by entry_point! below.
 
+mod narrate;
 mod serial;
 
 use bootloader_api::BootInfo;
@@ -39,11 +40,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         console.init();
     }
 
-    println!("5AM-OS is alive.");
-    println!("That sentence came out of a serial port we configured ourselves.");
+    narrate::banner();
+    narrate::what_just_happened(boot_info);
+    narrate::where_are_we();
+    narrate::memory_map(boot_info);
 
-    // Nothing left to do -- and "nothing left to do" in a kernel does not mean
-    // return. There is no caller.
     halt_forever();
 }
 
