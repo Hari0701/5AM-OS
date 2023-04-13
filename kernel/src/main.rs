@@ -11,6 +11,7 @@
 #![no_main] // No `main`: there is no runtime to call it. The bootloader jumps
             // straight to the symbol named by entry_point! below.
 
+mod gdt;
 mod narrate;
 mod serial;
 
@@ -44,6 +45,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     narrate::what_just_happened(boot_info);
     narrate::where_are_we();
     narrate::memory_map(boot_info);
+
+    // Order matters here, and each step depends on the one before it.
+    //
+    // The GDT must exist before the IDT, because every IDT entry names a code
+    // segment selector from the GDT — and the double fault entry names an IST
+    // slot that lives in the TSS, which the GDT points at.
+    narrate::step("gdt", "describing memory segments in our own words");
+    unsafe { gdt::init() };
 
     halt_forever();
 }

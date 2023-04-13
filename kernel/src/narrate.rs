@@ -170,3 +170,8 @@ fn read_cpu_state() -> (u16, u64, u64, u64, u64, u64) {
     }
     (cs, rsp, cr0, cr3, cr4, rip)
 }
+
+/// One line per initialisation step, printed as it happens.
+pub fn step(tag: &str, what: &str) {
+    println!("[{tag:<4}] {what}");
+}
