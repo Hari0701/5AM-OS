@@ -6,7 +6,8 @@
 //!
 //! In 64-bit mode segmentation is *mostly* dead — the base and limit fields are
 //! ignored and every segment covers all of memory. What survives matters a lot
-//! though: the privilege level, ring 0 versus ring 3.
+//! though: the privilege level (ring 0 vs ring 3), and the TSS, which tells the
+//! CPU which stack to switch to when something goes catastrophically wrong.
 
 use core::arch::asm;
 use core::mem::size_of;
@@ -15,9 +16,63 @@ use core::mem::size_of;
 /// requested privilege level in the low two bits.
 pub const KERNEL_CODE: u16 = 1 << 3; // entry 1, ring 0
 pub const KERNEL_DATA: u16 = 2 << 3; // entry 2, ring 0
+pub const TSS_SELECTOR: u16 = 3 << 3; // entry 3-4 (a TSS descriptor is 16 bytes)
 
-/// The table itself: null, code, data.
-static mut GDT: [u64; 3] = [0; 3];
+/// Interrupt Stack Table slot we reserve for double faults.
+pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+
+/// A stack used *only* for double faults.
+///
+/// This is the whole reason we bother with a TSS. If the kernel stack overflows,
+/// the CPU tries to push a page-fault frame onto the broken stack, fails, and
+/// escalates to a double fault — which tries to push again onto the same broken
+/// stack, fails again, and triple faults. A triple fault is not an exception;
+/// it is the CPU giving up and resetting the machine, with nothing printed.
+///
+/// The IST breaks that chain by giving the double fault handler a *known good*
+/// stack, so it can run and tell us what happened.
+const STACK_SIZE: usize = 4096 * 5;
+static mut DOUBLE_FAULT_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+
+/// The Task State Segment.
+///
+/// A leftover from 1985, when the CPU could switch tasks in hardware. Long mode
+/// dropped all of that; the struct survives because two of its fields are still
+/// useful — the privilege stack table and the interrupt stack table.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Tss {
+    reserved_1: u32,
+    /// Stacks to switch to when entering rings 0-2. Needed once we have
+    /// userspace; zero for now.
+    privilege_stack_table: [u64; 3],
+    reserved_2: u64,
+    /// Seven known-good stacks an interrupt can be forced onto.
+    interrupt_stack_table: [u64; 7],
+    reserved_3: u64,
+    reserved_4: u16,
+    iomap_base: u16,
+}
+
+impl Tss {
+    const fn new() -> Self {
+        Self {
+            reserved_1: 0,
+            privilege_stack_table: [0; 3],
+            reserved_2: 0,
+            interrupt_stack_table: [0; 7],
+            reserved_3: 0,
+            reserved_4: 0,
+            // No I/O permission bitmap: point past the end of the struct.
+            iomap_base: size_of::<Tss>() as u16,
+        }
+    }
+}
+
+static mut TSS: Tss = Tss::new();
+
+/// The table itself: null, code, data, and a 16-byte TSS descriptor.
+static mut GDT: [u64; 5] = [0; 5];
 
 /// What `lgdt` actually consumes: a limit and a base address.
 #[repr(C, packed)]
@@ -33,6 +88,13 @@ struct DescriptorTablePointer {
 /// with interrupts disabled.
 pub unsafe fn init() {
     unsafe {
+        // Point IST slot 0 at the top of our double-fault stack. Stacks on x86
+        // grow *downwards*, so the usable pointer is the END of the array.
+        let stack_start = core::ptr::addr_of!(DOUBLE_FAULT_STACK) as u64;
+        let stack_end = stack_start + STACK_SIZE as u64;
+        let tss = &mut *core::ptr::addr_of_mut!(TSS);
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
+
         let gdt = &mut *core::ptr::addr_of_mut!(GDT);
 
         // [0] The null descriptor. Required, and required to be zero: a segment
@@ -50,9 +112,23 @@ pub unsafe fn init() {
         //     writable descriptor.
         gdt[2] = (1 << 44) | (1 << 47) | (1 << 41);
 
+        // [3..4] The TSS descriptor is *sixteen* bytes — a 64-bit base does not
+        //        fit in the old eight-byte layout, so it occupies two entries.
+        let tss_addr = core::ptr::addr_of!(TSS) as u64;
+        let limit = (size_of::<Tss>() - 1) as u64;
+        let mut low: u64 = 0;
+        low |= limit & 0xFFFF; // limit 0:15
+        low |= (tss_addr & 0xFF_FFFF) << 16; // base 0:23
+        low |= 0b1001 << 40; // type: available 64-bit TSS
+        low |= 1 << 47; // present
+        low |= ((limit >> 16) & 0xF) << 48; // limit 16:19
+        low |= ((tss_addr >> 24) & 0xFF) << 56; // base 24:31
+        gdt[3] = low;
+        gdt[4] = tss_addr >> 32; // base 32:63
+
         // Tell the CPU where the table is.
         let pointer = DescriptorTablePointer {
-            limit: (size_of::<[u64; 3]>() - 1) as u16,
+            limit: (size_of::<[u64; 5]>() - 1) as u16,
             base: core::ptr::addr_of!(GDT) as u64,
         };
         asm!("lgdt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
@@ -81,6 +157,8 @@ pub unsafe fn init() {
             options(nostack, preserves_flags),
         );
 
+        // Finally, tell the CPU where the TSS is so IST lookups work.
+        asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
     }
 }
 
@@ -94,6 +172,6 @@ pub fn current() -> (u64, u16) {
 }
 
 /// The raw entries, so the shell can decode them in front of you.
-pub fn entries() -> [u64; 3] {
+pub fn entries() -> [u64; 5] {
     unsafe { *core::ptr::addr_of!(GDT) }
 }
