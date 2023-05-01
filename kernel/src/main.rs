@@ -10,8 +10,10 @@
 #![no_std] // No standard library: std assumes an OS underneath. We are the OS.
 #![no_main] // No `main`: there is no runtime to call it. The bootloader jumps
             // straight to the symbol named by entry_point! below.
+#![feature(abi_x86_interrupt)] // Lets us write interrupt handlers as plain fns.
 
 mod gdt;
+mod interrupts;
 mod narrate;
 mod serial;
 
@@ -53,6 +55,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // slot that lives in the TSS, which the GDT points at.
     narrate::step("gdt", "describing memory segments in our own words");
     unsafe { gdt::init() };
+
+    // Handlers must be installed before interrupts are enabled, or the first
+    // timer tick lands on an empty vector.
+    narrate::step("idt", "installing fault handlers and remapping the PIC");
+    unsafe { interrupts::init() };
+
+    narrate::ready();
 
     halt_forever();
 }

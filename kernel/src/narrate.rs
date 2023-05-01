@@ -175,3 +175,10 @@ fn read_cpu_state() -> (u16, u64, u64, u64, u64, u64) {
 pub fn step(tag: &str, what: &str) {
     println!("[{tag:<4}] {what}");
 }
+
+pub fn ready() {
+    println!();
+    println!("[ok  ] The kernel is now interrupt-driven. Nothing below this");
+    println!("       point runs unless hardware asks for it, or you type.");
+    println!();
+}
