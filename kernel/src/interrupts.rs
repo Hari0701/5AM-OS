@@ -9,6 +9,7 @@
 //! Intel (faults the CPU raises itself). The rest are ours, and we point the
 //! next 16 at hardware devices via the PIC.
 
+use crate::serial::outb;
 use crate::{gdt, println};
 use core::arch::asm;
 use core::mem::size_of;
@@ -75,8 +76,27 @@ struct DescriptorTablePointer {
 
 static mut IDT: [Entry; 256] = [Entry::empty(); 256];
 
+// The 8259 PIC pair. Vectors 0-31 are Intel's, so the PIC's default of 8-15
+// collides with them — remapping is not optional.
+const PIC1_COMMAND: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+const PIC2_COMMAND: u16 = 0xA0;
+const PIC2_DATA: u16 = 0xA1;
+const PIC_EOI: u8 = 0x20;
+
+pub const TIMER_VECTOR: u8 = 32;
+pub const KEYBOARD_VECTOR: u8 = 33;
+
+/// Ticks since boot. Written by the timer interrupt, read by everyone else.
+static mut TICKS: u64 = 0;
+
+pub fn ticks() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TICKS)) }
+}
+
 /// # Safety
-/// Installs the IDT. Call once, after the GDT is loaded.
+/// Installs the IDT and reprograms the interrupt controller. Call once, after
+/// the GDT is loaded, with interrupts still disabled.
 pub unsafe fn init() {
     unsafe {
         let idt = &mut *core::ptr::addr_of_mut!(IDT);
@@ -89,12 +109,52 @@ pub unsafe fn init() {
         idt[13].set(general_protection as *const () as u64, 0);
         idt[14].set(page_fault as *const () as u64, 0);
 
+        idt[TIMER_VECTOR as usize].set(timer as *const () as u64, 0);
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<[Entry; 256]>() - 1) as u16,
             base: core::ptr::addr_of!(IDT) as u64,
         };
         asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
+
+        remap_pic();
+    }
+}
+
+/// Move the PIC's interrupts from vectors 8-15 to 32-47.
+///
+/// The 8259 is configured by writing a fixed sequence of "initialisation
+/// command words" in order. There is no way to read the current state back;
+/// you simply have to do it right.
+unsafe fn remap_pic() {
+    unsafe {
+        // ICW1: begin initialisation, expect ICW4.
+        outb(PIC1_COMMAND, 0x11);
+        outb(PIC2_COMMAND, 0x11);
+        // ICW2: the new vector offsets.
+        outb(PIC1_DATA, TIMER_VECTOR);
+        outb(PIC2_DATA, TIMER_VECTOR + 8);
+        // ICW3: how the two chips are wired to each other.
+        outb(PIC1_DATA, 4); // secondary is on primary's IRQ2
+        outb(PIC2_DATA, 2); // secondary's identity is 2
+        // ICW4: 8086 mode.
+        outb(PIC1_DATA, 0x01);
+        outb(PIC2_DATA, 0x01);
+
+        // Mask everything except the timer (IRQ0). A device
+        // we have no handler for would otherwise interrupt us into a fault.
+        outb(PIC1_DATA, 0b1111_1110);
+        outb(PIC2_DATA, 0b1111_1111);
+    }
+}
+
+/// Tell the PIC we are done, or it will never send that IRQ again.
+unsafe fn end_of_interrupt(vector: u8) {
+    unsafe {
+        if vector >= TIMER_VECTOR + 8 {
+            outb(PIC2_COMMAND, PIC_EOI);
+        }
+        outb(PIC1_COMMAND, PIC_EOI);
     }
 }
 
@@ -191,6 +251,14 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _error: u64) 
     println!("       Reached this handler on the IST stack, which is the only");
     println!("       reason you are reading this instead of watching a reboot.");
     crate::halt_forever();
+}
+
+extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
+    unsafe {
+        let ticks = core::ptr::addr_of_mut!(TICKS);
+        core::ptr::write_volatile(ticks, core::ptr::read_volatile(ticks) + 1);
+        end_of_interrupt(TIMER_VECTOR);
+    }
 }
 
 /// Where the CPU thinks the IDT is — for `explain idt`.

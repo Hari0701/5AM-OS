@@ -61,6 +61,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     narrate::step("idt", "installing fault handlers and remapping the PIC");
     unsafe { interrupts::init() };
 
+    narrate::step("sti", "enabling interrupts — the machine can now interrupt us");
+    interrupts::enable();
+
     narrate::ready();
 
     halt_forever();
