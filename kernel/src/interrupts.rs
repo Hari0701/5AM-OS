@@ -9,7 +9,8 @@
 //! Intel (faults the CPU raises itself). The rest are ours, and we point the
 //! next 16 at hardware devices via the PIC.
 
-use crate::serial::outb;
+use crate::keyboard;
+use crate::serial::{inb, outb};
 use crate::{gdt, println};
 use core::arch::asm;
 use core::mem::size_of;
@@ -110,6 +111,7 @@ pub unsafe fn init() {
         idt[14].set(page_fault as *const () as u64, 0);
 
         idt[TIMER_VECTOR as usize].set(timer as *const () as u64, 0);
+        idt[KEYBOARD_VECTOR as usize].set(keyboard_irq as *const () as u64, 0);
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<[Entry; 256]>() - 1) as u16,
@@ -141,9 +143,9 @@ unsafe fn remap_pic() {
         outb(PIC1_DATA, 0x01);
         outb(PIC2_DATA, 0x01);
 
-        // Mask everything except the timer (IRQ0). A device
+        // Mask everything except the timer (IRQ0) and keyboard (IRQ1). A device
         // we have no handler for would otherwise interrupt us into a fault.
-        outb(PIC1_DATA, 0b1111_1110);
+        outb(PIC1_DATA, 0b1111_1100);
         outb(PIC2_DATA, 0b1111_1111);
     }
 }
@@ -259,6 +261,15 @@ extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
         core::ptr::write_volatile(ticks, core::ptr::read_volatile(ticks) + 1);
         end_of_interrupt(TIMER_VECTOR);
     }
+}
+
+extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
+    // Port 0x60 is the keyboard controller's data register. The byte must be
+    // read even if we do nothing with it, or the controller will not send
+    // another interrupt.
+    let scancode = unsafe { inb(0x60) };
+    keyboard::push_scancode(scancode);
+    unsafe { end_of_interrupt(KEYBOARD_VECTOR) };
 }
 
 /// Where the CPU thinks the IDT is — for `explain idt`.
