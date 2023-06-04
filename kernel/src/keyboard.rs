@@ -9,6 +9,80 @@
 //! controller still emulates by default forty years later.
 
 use crate::interrupts::without_interrupts;
+use crate::serial::{inb, outb};
+
+/// PS/2 controller ports.
+const DATA: u16 = 0x60;
+const STATUS: u16 = 0x64; // read
+const COMMAND: u16 = 0x64; // write
+
+/// Wake the keyboard up and empty its output buffer.
+///
+/// This is the step whose absence looks like broken hardware. The controller
+/// raises IRQ1 only when a byte lands in an *empty* output buffer. If the
+/// firmware left one sitting there, the buffer is already full, no interrupt is
+/// ever raised, and every key you press vanishes with no error anywhere.
+///
+/// # Safety
+/// Talks directly to the PS/2 controller. Call once, before enabling IRQ1.
+pub unsafe fn init() {
+    unsafe {
+        // Enable the first PS/2 port. Usually already on after BIOS, but the
+        // bootloader is entitled to have turned it off.
+        outb(COMMAND, 0xAE);
+
+        // Drain whatever is stale. Status bit 0 = output buffer full.
+        let mut drained = 0;
+        while inb(STATUS) & 1 != 0 && drained < 16 {
+            let _ = inb(DATA);
+            drained += 1;
+        }
+
+        // Now the part that unmasking the PIC does not cover.
+        //
+        // The controller has its own configuration byte, and bit 0 of it is
+        // "raise IRQ1 when port 1 has data". If that bit is clear the keyboard
+        // is silent no matter what the PIC thinks, which looks exactly like
+        // broken hardware: keys go in, nothing comes out, no fault, no clue.
+        outb(COMMAND, 0x20); // "give me the configuration byte"
+        let mut config = read_data();
+        config |= 1 << 0; // port 1 interrupt enable
+        config &= !(1 << 4); // clear "port 1 clock disabled"
+        outb(COMMAND, 0x60); // "here is a new configuration byte"
+        write_data(config);
+
+        // Tell the keyboard itself to start scanning.
+        write_data(0xF4);
+        let _ = read_data();
+    }
+}
+
+/// Wait for the controller to have a byte for us, then take it.
+unsafe fn read_data() -> u8 {
+    unsafe {
+        let mut spins = 0;
+        while inb(STATUS) & 1 == 0 && spins < 100_000 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        inb(DATA)
+    }
+}
+
+/// Wait for the controller's input buffer to drain, then write.
+///
+/// Status bit 1 means "input buffer full — do not write yet". Writing anyway
+/// silently loses the byte.
+unsafe fn write_data(value: u8) {
+    unsafe {
+        let mut spins = 0;
+        while inb(STATUS) & (1 << 1) != 0 && spins < 100_000 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        outb(DATA, value);
+    }
+}
 
 /// A ring buffer between the interrupt handler and the shell.
 ///

@@ -14,6 +14,7 @@
 
 mod gdt;
 mod interrupts;
+mod keyboard;
 mod narrate;
 mod serial;
 
@@ -60,6 +61,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // timer tick lands on an empty vector.
     narrate::step("idt", "installing fault handlers and remapping the PIC");
     unsafe { interrupts::init() };
+
+    narrate::step("ps2 ", "waking the keyboard controller and draining its buffer");
+    unsafe { keyboard::init() };
 
     narrate::step("sti", "enabling interrupts — the machine can now interrupt us");
     interrupts::enable();
