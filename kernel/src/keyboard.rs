@@ -110,11 +110,13 @@ static mut QUEUE: ScancodeQueue = ScancodeQueue {
 /// losing the newest keystroke is less confusing than losing an older one.
 pub fn push_scancode(scancode: u8) {
     unsafe {
-        let queue = &mut *core::ptr::addr_of_mut!(QUEUE);
-        let next = (queue.write + 1) % CAPACITY;
-        if next != queue.read {
-            queue.buffer[queue.write] = scancode;
-            queue.write = next;
+        let queue = core::ptr::addr_of_mut!(QUEUE);
+        let write = core::ptr::read_volatile(&raw const (*queue).write);
+        let read = core::ptr::read_volatile(&raw const (*queue).read);
+        let next = (write + 1) % CAPACITY;
+        if next != read {
+            core::ptr::write_volatile(&raw mut (*queue).buffer[write], scancode);
+            core::ptr::write_volatile(&raw mut (*queue).write, next);
         }
     }
 }
@@ -128,6 +130,17 @@ fn pop_scancode() -> Option<u8> {
     without_interrupts(|| unsafe {
         let queue = core::ptr::addr_of_mut!(QUEUE);
 
+        // Volatile is not optional here, and the reason is worth understanding.
+        //
+        // The compiler analyses this loop and sees nothing that writes to the
+        // queue, so it is entitled to read `write` once and reuse that value
+        // forever. It cannot see the interrupt handler, because nothing in the
+        // program *calls* it — the hardware does. The result is a shell that
+        // hangs with a full input buffer, having decided in advance that no
+        // input would ever arrive.
+        //
+        // `read_volatile` says: this memory changes for reasons you cannot see,
+        // load it every single time.
         let read = core::ptr::read_volatile(&raw const (*queue).read);
         let write = core::ptr::read_volatile(&raw const (*queue).write);
         if read == write {
