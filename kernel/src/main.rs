@@ -17,6 +17,7 @@ mod interrupts;
 mod keyboard;
 mod narrate;
 mod serial;
+mod shell;
 
 use bootloader_api::BootInfo;
 use core::panic::PanicInfo;
@@ -70,7 +71,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     narrate::ready();
 
-    halt_forever();
+    // Hand the memory map to the shell, then never return.
+    shell::set_boot_info(boot_info);
+    shell::run();
 }
 
 /// Stop the CPU in the cheapest way available.
