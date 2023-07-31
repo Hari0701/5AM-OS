@@ -65,7 +65,7 @@ pub fn run() -> ! {
 fn banner() {
     println!();
     println!("5AM-OS shell. Everything below reads the live machine.");
-    println!("Type `help`.");
+    println!("Type `help`, or `explain <topic>` to learn what is under you.");
     println!();
 }
 
@@ -78,6 +78,7 @@ fn execute(command: &str) {
     match verb {
         "" => {}
         "help" => help(),
+        "explain" => explain(rest),
         "regs" => regs(),
         "gdt" => dump_gdt(),
         "idt" => dump_idt(),
@@ -101,12 +102,129 @@ fn split(input: &str) -> (&str, &str) {
 fn help() {
     println!("commands:");
     println!("  help              this list");
+    println!("  explain <topic>   read the machine and explain a subsystem");
+    println!("                    topics: boot gdt idt interrupts paging");
+    println!("                            rings serial keyboard");
     println!("  regs              live control registers");
     println!("  gdt               decode every GDT entry");
     println!("  idt               which interrupt vectors are wired up");
     println!("  mem               physical memory map from the firmware");
     println!("  uptime            timer ticks since boot");
     println!("  clear             clear the screen");
+}
+
+fn explain(topic: &str) {
+    match topic {
+        "boot" => {
+            println!("BOOT");
+            println!("  The CPU starts in 16-bit real mode for compatibility with");
+            println!("  1978. Getting to 64-bit long mode means: build a GDT,");
+            println!("  enable protected mode, build page tables, enable PAE,");
+            println!("  set the long mode bit, enable paging, far jump. In that");
+            println!("  order. Any mistake is a triple fault with no message.");
+            println!();
+            println!("  Right now that work is done for us by the `bootloader`");
+            println!("  crate. Replacing it with our own stage is a milestone.");
+        }
+        "gdt" => {
+            let (base, limit) = gdt::current();
+            println!("GDT — Global Descriptor Table");
+            println!("  The CPU's list of memory segments.");
+            println!();
+            println!("  Live: base {base:#018x}, limit {limit} ({} entries)", (limit + 1) / 8);
+            println!();
+            println!("  In 64-bit mode segment base and limit are ignored: every");
+            println!("  segment is all of memory. What still matters is the");
+            println!("  privilege level, and the TSS entry — which is how the");
+            println!("  CPU finds a known-good stack when the current one is");
+            println!("  unusable. Run `gdt` to decode the actual entries.");
+        }
+        "idt" => {
+            let (base, limit) = interrupts::current();
+            println!("IDT — Interrupt Descriptor Table");
+            println!("  256 slots. Each one says: when interrupt N happens, jump");
+            println!("  here, on this stack, at this privilege level.");
+            println!();
+            println!("  Live: base {base:#018x}, limit {limit}");
+            println!();
+            println!("  Vectors 0-31 are Intel's: the CPU raises them at you.");
+            println!("  32+ are yours. We pointed 32 and 33 at the timer and the");
+            println!("  keyboard. Run `idt` to see which are wired up.");
+        }
+        "interrupts" => {
+            println!("INTERRUPTS");
+            println!("  The mechanism that lets hardware get your attention");
+            println!("  without you asking. Without them a kernel must poll, and");
+            println!("  polling means burning a core to notice a keypress.");
+            println!();
+            println!("  When one fires the CPU pushes RIP, CS, RFLAGS, RSP, SS,");
+            println!("  looks up the IDT, and jumps. Your handler must preserve");
+            println!("  every register and return with `iretq` — which is what");
+            println!("  Rust's `extern \"x86-interrupt\"` does for us.");
+            println!();
+            println!("  Ticks so far: {}", interrupts::ticks());
+            println!("  That number is incremented by a handler running roughly");
+            println!("  18.2 times a second, entirely behind your back.");
+        }
+        "paging" => {
+            let cr3: u64;
+            unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+            println!("PAGING");
+            println!("  Every address your code uses is a lie the CPU maintains.");
+            println!();
+            println!("  CR3 = {cr3:#018x}");
+            println!("  ^ physical address of the level-4 page table. A virtual");
+            println!("    address is split into four 9-bit indexes plus a 12-bit");
+            println!("    offset; the CPU walks four tables to find the physical");
+            println!("    frame. That is four extra memory reads per access,");
+            println!("    which is why the TLB cache exists.");
+            println!();
+            println!("  This is what makes each program think it owns the");
+            println!("  machine, and what stops it reaching into another's memory.");
+        }
+        "rings" => {
+            let cs: u16;
+            unsafe { asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack)) };
+            println!("PRIVILEGE RINGS");
+            println!("  x86 has four; everyone uses two.");
+            println!();
+            println!("  Current CS = {cs:#06x} -> ring {}", cs & 0b11);
+            println!();
+            println!("  Ring 0 can execute any instruction, read any register,");
+            println!("  touch any memory. Ring 3 cannot do I/O, cannot load");
+            println!("  descriptor tables, cannot disable interrupts. Every");
+            println!("  program you have ever run was in ring 3, asking a ring 0");
+            println!("  kernel for permission. You are currently the thing that");
+            println!("  grants permission.");
+        }
+        "serial" => {
+            println!("SERIAL");
+            println!("  A 16550 UART at I/O port 0x3F8. Writing one byte there");
+            println!("  puts a character on the wire.");
+            println!();
+            println!("  x86 has a second address space for devices, reached only");
+            println!("  with `in` and `out`. That is why serial works with zero");
+            println!("  setup while the screen needs a framebuffer and a font.");
+            println!("  It is also why every serious kernel keeps a serial");
+            println!("  console: it still works when everything else is broken.");
+        }
+        "keyboard" => {
+            println!("KEYBOARD");
+            println!("  The keyboard sends scancodes, not characters. One number");
+            println!("  when a key goes down, another when it comes up.");
+            println!();
+            println!("  'A' is not a thing the hardware knows. The kernel decides");
+            println!("  that scancode 0x1E plus shift means 'A' — which is why");
+            println!("  keyboard layouts are software.");
+            println!();
+            println!("  The interrupt handler does almost nothing: read port 0x60,");
+            println!("  push the byte into a ring buffer, return. This shell pops");
+            println!("  from that buffer with interrupts disabled, because the");
+            println!("  handler can fire in the middle of our read.");
+        }
+        "" => println!("usage: explain <topic>   (see `help` for the list)"),
+        other => println!("no topic called `{other}` — see `help`"),
+    }
 }
 
 fn regs() {
