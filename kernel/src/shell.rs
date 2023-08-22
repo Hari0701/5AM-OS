@@ -84,6 +84,7 @@ fn execute(command: &str) {
         "idt" => dump_idt(),
         "mem" => mem(),
         "uptime" => uptime(),
+        "fault" => fault(rest),
         "clear" => print!("\x1b[2J\x1b[H"),
         other => {
             println!("unknown command: {other}");
@@ -110,6 +111,8 @@ fn help() {
     println!("  idt               which interrupt vectors are wired up");
     println!("  mem               physical memory map from the firmware");
     println!("  uptime            timer ticks since boot");
+    println!("  fault <kind>      deliberately break something:");
+    println!("                    int3 | div0 | page | stack");
     println!("  clear             clear the screen");
 }
 
@@ -328,4 +331,50 @@ fn uptime() {
     // The PIT free-runs at ~18.2065 Hz by default. We have not reprogrammed it,
     // so this is the divisor the BIOS left behind.
     println!("  {ticks} ticks  (~{} seconds at the PIT's default 18.2 Hz)", ticks / 18);
+}
+
+/// Deliberately break the machine, to prove the handlers are real.
+fn fault(kind: &str) {
+    match kind {
+        "int3" => {
+            println!("  executing int3 ...");
+            unsafe { asm!("int3", options(nomem, nostack)) };
+            println!("  ...and we came back. A handled exception is survivable.");
+        }
+        "div0" => {
+            println!("  dividing by zero ...");
+            unsafe {
+                asm!(
+                    "xor rdx, rdx",
+                    "xor rcx, rcx",
+                    "mov rax, 1",
+                    "div rcx",
+                    out("rax") _, out("rdx") _, out("rcx") _,
+                    options(nomem, nostack),
+                );
+            }
+        }
+        "page" => {
+            println!("  dereferencing 0xdeadbeef ...");
+            unsafe {
+                let bad = 0xdead_beef as *mut u64;
+                core::ptr::write_volatile(bad, 42);
+            }
+        }
+        "stack" => {
+            println!("  recursing until the stack runs out ...");
+            println!("  (this is the one that would reboot a machine without an");
+            println!("   IST stack for the double fault handler)");
+            blow_the_stack(0);
+        }
+        _ => println!("  usage: fault int3|div0|page|stack"),
+    }
+}
+
+/// Infinite recursion, to prove the double fault handler is real.
+#[allow(unconditional_recursion)]
+fn blow_the_stack(depth: u64) {
+    let marker = depth;
+    unsafe { core::ptr::read_volatile(&marker) };
+    blow_the_stack(depth + 1);
 }
