@@ -372,9 +372,16 @@ fn fault(kind: &str) {
 }
 
 /// Infinite recursion, to prove the double fault handler is real.
+///
+/// Getting this to actually overflow takes some care. The obvious version —
+/// recurse, then return — is a *tail call*, and LLVM rewrites tail calls into
+/// jumps. The stack then never grows and the machine happily loops forever.
+///
+/// Touching a local *after* the recursive call is what prevents that: the frame
+/// has to survive the call, so a real frame must be pushed every time.
 #[allow(unconditional_recursion)]
 fn blow_the_stack(depth: u64) {
     let marker = depth;
-    unsafe { core::ptr::read_volatile(&marker) };
     blow_the_stack(depth + 1);
+    unsafe { core::ptr::read_volatile(&marker) };
 }
