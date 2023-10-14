@@ -6,4 +6,11 @@ edition = "2021"
 # This one runs on your Mac, not on 5AM-OS. It takes the compiled kernel and
 # wraps it in a bootable disk image.
 [dependencies]
-bootloader = "0.11"
+# BIOS only, deliberately.
+#
+# The crate's `uefi` feature builds a UEFI bootloader whose pinned `uefi`
+# dependency does not link against current nightly (undefined reference to
+# uefi::proto::shell::Shell::current_dir). That is upstream, not ours, and we
+# do not need it: QEMU boots the BIOS image happily. Re-enable the feature when
+# the ecosystem catches up and you want to boot real UEFI hardware.
+bootloader = { version = "0.11", default-features = false, features = ["bios"] }
