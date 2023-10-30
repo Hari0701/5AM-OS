@@ -16,6 +16,13 @@ use core::fmt;
 /// moved since the IBM PC in 1981.
 const COM1: u16 = 0x3F8;
 
+/// COM2. A second, independent UART — the kernel's channel to the AI bridge.
+///
+/// Using a separate port rather than multiplexing COM1 means the protocol never
+/// has to be untangled from console output, and a bridge that is not attached
+/// simply times out instead of corrupting what you are reading.
+pub const COM2: u16 = 0x2F8;
+
 // Register offsets from the port base. Several of these registers change
 // meaning depending on the DLAB bit below, which is a piece of 1970s hardware
 // frugality we still live with.
@@ -105,6 +112,32 @@ impl SerialPort {
         unsafe { inb(self.base + LINE_STATUS) & 0x20 != 0 }
     }
 
+    /// True when a byte has arrived and is waiting to be read.
+    fn has_data(&self) -> bool {
+        // Bit 0 of the line status register: "data ready".
+        unsafe { inb(self.base + LINE_STATUS) & 1 != 0 }
+    }
+
+    /// Take one byte if the other end has sent one. Never blocks.
+    pub fn try_recv(&mut self) -> Option<u8> {
+        if self.has_data() {
+            Some(unsafe { inb(self.base + DATA) })
+        } else {
+            None
+        }
+    }
+
+    /// Write a byte without the CRLF translation `send` does.
+    ///
+    /// The console translates newlines for the benefit of a terminal. A protocol
+    /// must not: an extra carriage return would corrupt every framed message.
+    pub fn send_raw(&mut self, byte: u8) {
+        while !self.can_send() {
+            core::hint::spin_loop();
+        }
+        unsafe { outb(self.base + DATA, byte) };
+    }
+
     pub fn send(&mut self, byte: u8) {
         // A terminal expects CRLF; a kernel emits LF. Translate, or every line
         // after the first starts wherever the previous one ended.
@@ -139,6 +172,9 @@ impl fmt::Write for SerialPort {
 /// a second core, this becomes a spinlock — and that change is the whole lesson
 /// about why kernels need locks at all.
 pub static mut CONSOLE: SerialPort = SerialPort::new(COM1);
+
+/// The AI bridge channel. Silent unless something is listening on the other end.
+pub static mut BRIDGE: SerialPort = SerialPort::new(COM2);
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {

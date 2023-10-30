@@ -12,6 +12,7 @@
             // straight to the symbol named by entry_point! below.
 #![feature(abi_x86_interrupt)] // Lets us write interrupt handlers as plain fns.
 
+mod ai;
 mod gdt;
 mod interrupts;
 mod keyboard;
@@ -62,6 +63,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // timer tick lands on an empty vector.
     narrate::step("idt", "installing fault handlers and remapping the PIC");
     unsafe { interrupts::init() };
+
+    narrate::step("com2", "opening the AI bridge channel on the second serial port");
+    unsafe { ai::init() };
 
     narrate::step("ps2 ", "waking the keyboard controller and draining its buffer");
     unsafe { keyboard::init() };
