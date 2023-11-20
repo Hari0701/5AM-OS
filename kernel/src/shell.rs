@@ -85,6 +85,7 @@ fn execute(command: &str) {
         "mem" => mem(),
         "uptime" => uptime(),
         "fault" => fault(rest),
+        "ask" => ask(rest),
         "clear" => print!("\x1b[2J\x1b[H"),
         other => {
             println!("unknown command: {other}");
@@ -113,6 +114,8 @@ fn help() {
     println!("  uptime            timer ticks since boot");
     println!("  fault <kind>      deliberately break something:");
     println!("                    int3 | div0 | page | stack");
+    println!("  ask <question>    ask a language model about this machine,");
+    println!("                    with the live register state attached");
     println!("  clear             clear the screen");
 }
 
@@ -331,6 +334,21 @@ fn uptime() {
     // The PIT free-runs at ~18.2065 Hz by default. We have not reprogrammed it,
     // so this is the divisor the BIOS left behind.
     println!("  {ticks} ticks  (~{} seconds at the PIT's default 18.2 Hz)", ticks / 18);
+}
+
+/// Send a question out of the serial port and print what comes back.
+fn ask(question: &str) {
+    if question.is_empty() {
+        println!("  usage: ask <question>");
+        println!();
+        println!("  The question goes out over COM2 with this machine's live");
+        println!("  register state attached, to a bridge process running on the");
+        println!("  host. Nothing about the model runs inside 5AM-OS -- see the");
+        println!("  module comment in kernel/src/ai.rs for why, and what would");
+        println!("  have to exist for that to change.");
+        return;
+    }
+    crate::ai::ask(question);
 }
 
 /// Deliberately break the machine, to prove the handlers are real.
