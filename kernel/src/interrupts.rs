@@ -242,6 +242,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
     println!();
     println!("       This is the fault that makes virtual memory possible: a");
     println!("       real kernel would map a page here and return.");
+
+    // Ship the wreckage to the bridge before parking. If nothing is listening
+    // this times out and says so; the fault report above is already printed
+    // either way, so the diagnosis is never worse for having tried.
+    crate::ai::explain_fault("page_fault", frame.rip, error, address);
+
     crate::halt_forever();
 }
 
