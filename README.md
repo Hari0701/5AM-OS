@@ -57,6 +57,7 @@ boots it in QEMU with the serial console attached to your terminal. Quit with
 | PIC + timer | working | Why the 8259's defaults collide with Intel's own vectors |
 | PS/2 keyboard | working | Scancodes are not characters; layouts are software |
 | Shell | working | — |
+| AI bridge (COM2) | working | Serial is the kernel's only reach into the outside world |
 | Paging / allocator | not yet | |
 | Multitasking | not yet | |
 
@@ -72,6 +73,8 @@ idt               which interrupt vectors are wired up
 mem               physical memory map from the firmware
 uptime            timer ticks since boot
 fault <kind>      deliberately break something: int3 | div0 | page | stack
+ask <question>    ask a language model about this machine, with the
+                  live register state attached
 clear             clear the screen
 ```
 
@@ -92,6 +95,70 @@ machine silently resets. 5AM-OS survives it and tells you why:
 
 ---
 
+## The AI bridge
+
+5AM-OS can ask a language model about itself — including about its own crashes.
+
+**The model does not run inside the kernel, and the code does not pretend it
+does.** A kernel with no allocator, no filesystem and no network stack cannot
+load a multi-gigabyte model. What it *can* do is write bytes to a serial port,
+so that is what it does: the question, plus the live register state, goes out of
+COM2 to `bridge/bridge.py` on the host, which calls the Claude API and writes
+the answer back down the same wire.
+
+The serial port is genuinely the only I/O this kernel has, so this is the whole
+of its ability to reach the outside world — not a shortcut around one.
+
+```bash
+pip install -r bridge/requirements.txt
+export ANTHROPIC_API_KEY=...
+python3 bridge/bridge.py     # in one terminal
+./run.sh                     # in another
+```
+
+```
+5am> ask why is CR3 different from the address my kernel was loaded at?
+```
+
+Nothing else changes if the bridge is not running: `ask` times out after 90
+seconds and tells you how to start it, and every other command is unaffected.
+
+### Explaining its own crashes
+
+The interesting part is that the page fault handler uses the same channel. When
+the kernel faults, it ships its own wreckage — fault type, RIP, error code, CR2
+— out of the port *from inside the handler*, with interrupts disabled, before it
+halts:
+
+```
+5am> fault page
+
+[trap] PAGE FAULT
+       tried to touch : 0x00000000deadbeef
+       ...
+[ai  ] asking the bridge ...
+```
+
+### Wire protocol
+
+Plain text, so you can watch it with `nc` or replace the bridge with anything:
+
+```
+-> 5AMOS/1 ASK                 (or FAULT)
+-> state: cr0=0x... cr3=0x... ring=0 ticks=77 [fault=... rip=... cr2=...]
+-> q: <question>
+-> END
+<- <answer lines>
+<- END
+```
+
+The bridge is deliberately the dumbest possible participant. When 5AM-OS grows a
+virtio-net driver and a TCP stack, it is deleted and the kernel calls the API
+itself — the protocol above is shaped so that change touches nothing in the
+kernel above `ai.rs`.
+
+---
+
 ## Layout
 
 ```
@@ -102,6 +169,8 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   keyboard.rs    PS/2 scancodes -> characters
   shell.rs       the REPL, and every `explain` topic
   narrate.rs     the teaching layer for boot
+  ai.rs          the serial protocol for talking to a model
+bridge/          runs on your machine: serial <-> Claude API
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
 ```
@@ -124,6 +193,10 @@ because reading it is the point.
 - **No memory allocator.** Everything is fixed-size buffers and statics. That is
   why there is no `String` anywhere in this codebase.
 - **Single core, no scheduler.** One thread of execution, forever.
+- **The AI bridge needs a host process.** The kernel cannot reach a network by
+  itself yet, so `ask` talks to `bridge/bridge.py` over a serial port rather
+  than to the API directly. Removing that dependency means writing a virtio-net
+  driver and a TCP stack — a real milestone, not a small one.
 
 ---
 

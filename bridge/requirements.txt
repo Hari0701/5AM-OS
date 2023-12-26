@@ -1,0 +1,3 @@
+# The official Anthropic SDK. The bridge runs on your machine, not in 5AM-OS,
+# so it is an ordinary Python program with ordinary dependencies.
+anthropic>=0.40
