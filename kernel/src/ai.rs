@@ -19,6 +19,9 @@
 //!
 //! ## Protocol
 //!
+//! Faults are NOT sent here — `oracle.rs` decodes those inside the kernel,
+//! because a diagnosis you can trust beats one that needs a network.
+//!
 //! Request (kernel -> bridge), plain text, LF-terminated lines:
 //!
 //! ```text
@@ -82,25 +85,7 @@ fn write_line(port: &mut SerialPort, text: &str) {
 /// Ask a question, with the live machine state attached.
 pub fn ask(question: &str) {
     let state = StateLine::capture();
-    exchange("ASK", state.as_str(), question);
-}
-
-/// Ask about a fault, from inside the fault handler.
-///
-/// The extra detail — which fault, where, what address — is what makes the
-/// answer worth having. This runs with interrupts disabled on a possibly
-/// damaged stack, so it allocates nothing and takes no locks.
-pub fn explain_fault(kind: &str, rip: u64, error_code: u64, cr2: u64) {
-    let mut state = StateLine::capture();
-    let _ = write!(
-        state,
-        " fault={kind} rip={rip:#x} error={error_code:#x} cr2={cr2:#x}"
-    );
-    exchange(
-        "FAULT",
-        state.as_str(),
-        "Explain this fault: what did the kernel do wrong, and what would fix it?",
-    );
+    exchange("5AMOS/1 ASK", state.as_str(), question);
 }
 
 fn exchange(verb: &str, state: &str, question: &str) {
@@ -113,7 +98,7 @@ fn exchange(verb: &str, state: &str, question: &str) {
     // the answer to this question.
     while port.try_recv().is_some() {}
 
-    write_line(port, question_header(verb));
+    write_line(port, verb);
     write_line(port, state);
     for chunk in ["q: ", question] {
         for byte in chunk.bytes() {
@@ -124,13 +109,6 @@ fn exchange(verb: &str, state: &str, question: &str) {
     write_line(port, "END");
 
     read_reply(port);
-}
-
-fn question_header(verb: &str) -> &str {
-    match verb {
-        "FAULT" => "5AMOS/1 FAULT",
-        _ => "5AMOS/1 ASK",
-    }
 }
 
 /// Read the reply, printing it as it arrives, until a lone `END` line.

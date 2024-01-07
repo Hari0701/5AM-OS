@@ -17,6 +17,7 @@ mod gdt;
 mod interrupts;
 mod keyboard;
 mod narrate;
+mod oracle;
 mod serial;
 mod shell;
 

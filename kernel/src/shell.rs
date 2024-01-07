@@ -86,6 +86,7 @@ fn execute(command: &str) {
         "uptime" => uptime(),
         "fault" => fault(rest),
         "ask" => ask(rest),
+        "bridge" => bridge(rest),
         "clear" => print!("\x1b[2J\x1b[H"),
         other => {
             println!("unknown command: {other}");
@@ -113,9 +114,11 @@ fn help() {
     println!("  mem               physical memory map from the firmware");
     println!("  uptime            timer ticks since boot");
     println!("  fault <kind>      deliberately break something:");
-    println!("                    int3 | div0 | page | stack");
-    println!("  ask <question>    ask a language model about this machine,");
-    println!("                    with the live register state attached");
+    println!("                    int3 | div0 | page | null | wild | stack");
+    println!("  ask <question>    ask the kernel about itself. Answered inside");
+    println!("                    this machine -- no network, no host process.");
+    println!("  bridge <question> send the question out over COM2 to a host");
+    println!("                    process instead (optional, needs bridge.py)");
     println!("  clear             clear the screen");
 }
 
@@ -336,16 +339,28 @@ fn uptime() {
     println!("  {ticks} ticks  (~{} seconds at the PIT's default 18.2 Hz)", ticks / 18);
 }
 
-/// Send a question out of the serial port and print what comes back.
+/// Answer a question using only what is inside this machine.
 fn ask(question: &str) {
     if question.is_empty() {
         println!("  usage: ask <question>");
         println!();
-        println!("  The question goes out over COM2 with this machine's live");
-        println!("  register state attached, to a bridge process running on the");
-        println!("  host. Nothing about the model runs inside 5AM-OS -- see the");
-        println!("  module comment in kernel/src/ai.rs for why, and what would");
-        println!("  have to exist for that to change.");
+        println!("  Answered entirely inside 5AM-OS: no network, no host process,");
+        println!("  nothing to install. It reads the live registers and explains");
+        println!("  what it finds. See `ask how do you work` for what it actually");
+        println!("  is -- it is not a model, and it says so.");
+        return;
+    }
+    crate::oracle::answer(question);
+}
+
+/// Send a question out over COM2 to a host process.
+fn bridge(question: &str) {
+    if question.is_empty() {
+        println!("  usage: bridge <question>");
+        println!();
+        println!("  Sends the question out of the second serial port, with this");
+        println!("  machine's register state attached, to bridge/bridge.py on the");
+        println!("  host. Entirely optional -- `ask` needs nothing attached.");
         return;
     }
     crate::ai::ask(question);
@@ -372,6 +387,20 @@ fn fault(kind: &str) {
                 );
             }
         }
+        "null" => {
+            println!("  dereferencing a null pointer ...");
+            unsafe {
+                let bad = core::ptr::null_mut::<u64>();
+                core::ptr::write_volatile(bad, 42);
+            }
+        }
+        "wild" => {
+            println!("  dereferencing a non-canonical address ...");
+            unsafe {
+                let bad = 0xdead_beef_dead_beef_u64 as *mut u64;
+                core::ptr::write_volatile(bad, 42);
+            }
+        }
         "page" => {
             println!("  dereferencing 0xdeadbeef ...");
             unsafe {
@@ -385,7 +414,7 @@ fn fault(kind: &str) {
             println!("   IST stack for the double fault handler)");
             blow_the_stack(0);
         }
-        _ => println!("  usage: fault int3|div0|page|stack"),
+        _ => println!("  usage: fault int3|div0|page|null|wild|stack"),
     }
 }
 

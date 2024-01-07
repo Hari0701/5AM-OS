@@ -57,7 +57,8 @@ boots it in QEMU with the serial console attached to your terminal. Quit with
 | PIC + timer | working | Why the 8259's defaults collide with Intel's own vectors |
 | PS/2 keyboard | working | Scancodes are not characters; layouts are software |
 | Shell | working | — |
-| AI bridge (COM2) | working | Serial is the kernel's only reach into the outside world |
+| Answer engine | working | Decoding hardware beats guessing about it |
+| AI bridge (COM2) | optional | Serial is the kernel's only reach into the outside world |
 | Paging / allocator | not yet | |
 | Multitasking | not yet | |
 
@@ -72,9 +73,10 @@ gdt               decode every GDT entry
 idt               which interrupt vectors are wired up
 mem               physical memory map from the firmware
 uptime            timer ticks since boot
-fault <kind>      deliberately break something: int3 | div0 | page | stack
-ask <question>    ask a language model about this machine, with the
-                  live register state attached
+fault <kind>      break something: int3 | div0 | page | null | wild | stack
+ask <question>    ask the kernel about itself -- answered inside this
+                  machine, no network and no host process
+bridge <question> send the question to a host process over COM2 instead
 clear             clear the screen
 ```
 
@@ -95,7 +97,57 @@ machine silently resets. 5AM-OS survives it and tells you why:
 
 ---
 
-## The AI bridge
+## Asking the kernel about itself
+
+`ask` is answered **entirely inside 5AM-OS**. No network, no host process,
+nothing to install:
+
+```
+5am> ask why is cr3 not the same as where my kernel loaded
+
+PAGING -- why your addresses are fiction
+
+  CR3 = 0x0000000001195000
+  That is a PHYSICAL address, and it is the root of a four-level tree.
+  ...
+```
+
+**It is not a model, and it says so** — run `ask how do you work`. It is keyword
+matching over a hand-written corpus plus decoders that read live registers.
+Every sentence was written by a human; every number came out of the hardware a
+moment ago.
+
+That trade is deliberate. What it gives up in flexibility it gains in being
+*correct*, which is exactly what you want when the machine has just crashed:
+
+```
+5am> fault null
+
+[trap] PAGE FAULT
+       tried to touch : 0x0000000000000000
+...
+[why ] Reading the fault, not guessing at it:
+
+       It was a write of data, from ring 0.
+       The page is not mapped at all.
+
+       Most likely cause, judging by the address:
+       a null pointer dereference. Something unwrapped a null.
+```
+
+It decodes the real error-code bits and classifies the real faulting address, so
+it distinguishes a null dereference from an unmapped page from a malformed
+pointer — and it cannot invent a confident wrong answer, because it cannot
+invent anything.
+
+Writing `fault wild` taught the engine something true: a non-canonical address
+raises a **general protection fault**, not a page fault, because the CPU rejects
+the pointer shape before it ever consults the page tables. `#GP` carries no CR2,
+so the engine reads the error code's selector fields instead.
+
+---
+
+## The AI bridge (optional)
 
 5AM-OS can ask a language model about itself — including about its own crashes.
 

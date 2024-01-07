@@ -215,7 +215,8 @@ extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error: u64) {
     println!("\n[trap] GENERAL PROTECTION FAULT at {:#x}", frame.rip);
     println!("       error code {error:#x}");
-    println!("       Something was attempted that the current ring forbids.");
+    println!();
+    crate::oracle::explain_fault("general_protection", frame.rip, error, 0);
     crate::halt_forever();
 }
 
@@ -243,10 +244,11 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
     println!("       This is the fault that makes virtual memory possible: a");
     println!("       real kernel would map a page here and return.");
 
-    // Ship the wreckage to the bridge before parking. If nothing is listening
-    // this times out and says so; the fault report above is already printed
-    // either way, so the diagnosis is never worse for having tried.
-    crate::ai::explain_fault("page_fault", frame.rip, error, address);
+    // Diagnose it here, inside the machine that broke. No network, no host,
+    // no waiting -- and no chance of a confident wrong answer, because this
+    // decodes the real error bits rather than generating prose about them.
+    println!();
+    crate::oracle::explain_fault("page_fault", frame.rip, error, address);
 
     crate::halt_forever();
 }
@@ -258,6 +260,8 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _error: u64) 
     println!("       A fault occurred while handling a fault.");
     println!("       Reached this handler on the IST stack, which is the only");
     println!("       reason you are reading this instead of watching a reboot.");
+    println!();
+    crate::oracle::explain_fault("double_fault", frame.rip, 0, 0);
     crate::halt_forever();
 }
 
