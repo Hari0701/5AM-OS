@@ -10,12 +10,22 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # 1. The kernel, for bare metal.
-cargo build --package kernel --target x86_64-unknown-none --release
+#
+# The custom target enables SSE (the stock x86_64-unknown-none ships with
+# +soft-float, which would make the neural network unusably slow). No
+# precompiled `core` exists for a custom target, so it is built from source —
+# that is what build-std is for, and why the first build takes a while.
+cargo build --package kernel \
+  --target x86_64-5am_os.json \
+  -Z json-target-spec \
+  -Z build-std=core,compiler_builtins \
+  -Z build-std-features=compiler-builtins-mem \
+  --release
 
 # 2. The image builder, for this machine.
 cargo build --package boot --release
 
-KERNEL="target/x86_64-unknown-none/release/kernel"
+KERNEL="target/x86_64-5am_os/release/kernel"
 IMAGE="$(./target/release/boot "$KERNEL")"
 
 echo "==> booting $IMAGE"
@@ -38,5 +48,6 @@ exec qemu-system-x86_64 \
   -drive format=raw,file="$IMAGE" \
   -serial stdio \
   -serial "tcp:127.0.0.1:${BRIDGE_PORT:-4444},server=on,wait=off" \
-  -m 128M \
+  -cpu max \
+  -m 512M \
   "${DISPLAY_ARGS[@]}"

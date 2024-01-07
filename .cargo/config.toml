@@ -1,6 +1,8 @@
-# Deliberately NOT setting `build.target` here.
+# Deliberately NOT setting `build.target` or the build-std flags here.
 #
 # This workspace compiles for two machines: kernel/ for bare metal and boot/ for
-# your Mac. A global default target would force both, and the builder crate
-# would fail to compile for a machine with no OS. Each is passed its target
-# explicitly in run.sh instead.
+# your Mac. Anything set globally hits both — and `-Z build-std` in particular
+# breaks the host build, because rebuilding the standard library from source for
+# macOS is neither wanted nor possible here.
+#
+# The kernel's flags live in run.sh instead, applied only to the kernel build.

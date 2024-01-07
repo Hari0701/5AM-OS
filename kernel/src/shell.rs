@@ -84,6 +84,9 @@ fn execute(command: &str) {
         "idt" => dump_idt(),
         "mem" => mem(),
         "uptime" => uptime(),
+        "fpu" => fpu_check(),
+        "llm" => llm(rest),
+        "model" => crate::llm::describe(),
         "fault" => fault(rest),
         "ask" => ask(rest),
         "bridge" => bridge(rest),
@@ -113,6 +116,10 @@ fn help() {
     println!("  idt               which interrupt vectors are wired up");
     println!("  mem               physical memory map from the firmware");
     println!("  uptime            timer ticks since boot");
+    println!("  fpu               is floating point on, and does it work?");
+    println!("  model             what neural network is loaded, if any");
+    println!("  llm <prompt>      run that network. It writes stories; it does");
+    println!("                    NOT know anything about this kernel.");
     println!("  fault <kind>      deliberately break something:");
     println!("                    int3 | div0 | page | null | wild | stack");
     println!("  ask <question>    ask the kernel about itself. Answered inside");
@@ -330,6 +337,74 @@ fn mem() {
     }
     println!();
     println!("  {} MiB usable across {} regions.", usable / 1024 / 1024, info.memory_regions.len());
+}
+
+/// Run the in-kernel transformer.
+fn llm(prompt: &str) {
+    if prompt.is_empty() {
+        println!("  usage: llm <prompt>");
+        println!();
+        println!("  Runs a 15M-parameter Llama-2 transformer inside this kernel,");
+        println!("  in ring 0, with no OS beneath it and nothing linked in.");
+        println!();
+        println!("  It was trained on children's stories, so give it one to");
+        println!("  continue -- `llm Once upon a time`. It does not know what an");
+        println!("  operating system is; use `ask` for questions about this");
+        println!("  machine. Run `model` for what is actually loaded.");
+        return;
+    }
+    crate::llm::generate(prompt, 96);
+}
+
+/// Prove the FPU is on by doing arithmetic the CPU could not do at reset.
+fn fpu_check() {
+    let (cr0, cr4) = crate::fpu::state();
+    println!("  CR0 = {cr0:#018x}   EM(bit 2)={} MP(bit 1)={}", (cr0 >> 2) & 1, (cr0 >> 1) & 1);
+    println!("  CR4 = {cr4:#018x}   OSFXSR(bit 9)={} OSXMMEXCPT(bit 10)={}",
+        (cr4 >> 9) & 1, (cr4 >> 10) & 1);
+    println!();
+    if !crate::fpu::enabled() {
+        println!("  Floating point is OFF. Any float instruction would fault.");
+        return;
+    }
+
+    // Actual hardware arithmetic. If SSE were still emulated, reaching this
+    // line at all would have raised #UD.
+    let a = 3.5_f32;
+    let b = 1.25_f32;
+    let sum = a + b;
+    let product = a * b;
+    let quotient = a / b;
+    let root = crate::llm::sqrt(a * a);
+
+    println!("  3.5 + 1.25 = {}", FloatText(sum));
+    println!("  3.5 * 1.25 = {}", FloatText(product));
+    println!("  3.5 / 1.25 = {}", FloatText(quotient));
+    println!("  sqrt(12.25) = {}", FloatText(root));
+    println!();
+    println!("  Those were real SSE instructions on real XMM registers. At");
+    println!("  reset this CPU would have faulted on every one of them.");
+}
+
+/// Print an f32 without libm or an allocator.
+///
+/// core::fmt can format floats, but it pulls in a large formatting path; this
+/// is a fixed 4-decimal renderer, which is all the kernel needs.
+pub struct FloatText(pub f32);
+
+impl core::fmt::Display for FloatText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let value = self.0;
+        if value.is_nan() {
+            return write!(f, "NaN");
+        }
+        let negative = value < 0.0;
+        let magnitude = if negative { -value } else { value };
+        let whole = magnitude as u64;
+        let frac = ((magnitude - whole as f32) * 10_000.0 + 0.5) as u64;
+        let (whole, frac) = if frac >= 10_000 { (whole + 1, 0) } else { (whole, frac) };
+        write!(f, "{}{}.{:04}", if negative { "-" } else { "" }, whole, frac)
+    }
 }
 
 fn uptime() {

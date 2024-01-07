@@ -13,8 +13,10 @@
 #![feature(abi_x86_interrupt)] // Lets us write interrupt handlers as plain fns.
 
 mod ai;
+mod fpu;
 mod gdt;
 mod interrupts;
+mod llm;
 mod keyboard;
 mod narrate;
 mod oracle;
@@ -38,6 +40,17 @@ bootloader_api::entry_point!(kernel_main);
 /// bootloader real work to reach: 64-bit long mode, paging on, a stack under
 /// us. `boot_info` is its handover note — where memory is, and what it did.
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    // FIRST. Before the serial port, before a single println.
+    //
+    // This kernel is compiled with SSE enabled, and LLVM does not reserve XMM
+    // registers for float math — it uses them for ordinary struct and memory
+    // copies too. So SSE instructions appear in code that has nothing to do
+    // with arithmetic, including the code that would print a complaint.
+    //
+    // Enable it later and the machine dies silently mid-boot, which is exactly
+    // what happened the first time this was written.
+    unsafe { fpu::init() };
+
     // Downgrade to a shared reference: nothing mutates the boot info again.
     let boot_info: &'static BootInfo = boot_info;
     // SAFETY: nothing else has touched the UART, and we are single-threaded
@@ -57,6 +70,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The GDT must exist before the IDT, because every IDT entry names a code
     // segment selector from the GDT — and the double fault entry names an IST
     // slot that lives in the TSS, which the GDT points at.
+    narrate::step("fpu ", "SSE already enabled -- it had to be, to get this far");
     narrate::step("gdt", "describing memory segments in our own words");
     unsafe { gdt::init() };
 
@@ -70,6 +84,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     narrate::step("ps2 ", "waking the keyboard controller and draining its buffer");
     unsafe { keyboard::init() };
+
+    // Hand the ramdisk to the model loader. The bootloader has already placed
+    // it in memory; there is no filesystem involved and nothing is copied.
+    match (boot_info.ramdisk_addr.into_option(), boot_info.ramdisk_len) {
+        (Some(addr), len) if len > 0 => {
+            narrate::step("llm ", "parsing the neural network out of the ramdisk");
+            unsafe { llm::init(addr as *const u8, len as usize) };
+        }
+        _ => narrate::step("llm ", "no ramdisk -- booting without the model"),
+    }
 
     narrate::step("sti", "enabling interrupts — the machine can now interrupt us");
     interrupts::enable();
