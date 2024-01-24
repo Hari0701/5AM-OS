@@ -17,3 +17,6 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# The model weights are large and not ours to redistribute.
+/assets/
