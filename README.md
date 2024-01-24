@@ -57,7 +57,9 @@ boots it in QEMU with the serial console attached to your terminal. Quit with
 | PIC + timer | working | Why the 8259's defaults collide with Intel's own vectors |
 | PS/2 keyboard | working | Scancodes are not characters; layouts are software |
 | Shell | working | — |
+| FPU / SSE | working | The CPU boots unable to do float math |
 | Answer engine | working | Decoding hardware beats guessing about it |
+| Transformer (15M) | working | Real inference in ring 0, nothing linked in |
 | AI bridge (COM2) | optional | Serial is the kernel's only reach into the outside world |
 | Paging / allocator | not yet | |
 | Multitasking | not yet | |
@@ -144,6 +146,104 @@ Writing `fault wild` taught the engine something true: a non-canonical address
 raises a **general protection fault**, not a page fault, because the CPU rejects
 the pointer shape before it ever consults the page tables. `#GP` carries no CR2,
 so the engine reads the error code's selector fields instead.
+
+---
+
+## The neural network
+
+5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
+forward pass, with no operating system beneath it and nothing linked in.
+
+```
+5am> model
+  A Llama-2 transformer, running in ring 0.
+
+    dim         288
+    hidden      768
+    layers      6
+    heads       6  (6 kv)
+    vocab       32000 tokens
+    context     256 tokens
+```
+
+There is no BLAS, no libm, and no allocator. Every matmul is the loop in
+`llm.rs`; `exp` is a hand-written polynomial; every buffer is a fixed-size
+static. The weights arrive as a **ramdisk** the bootloader places in memory,
+because a kernel with no filesystem has no other way to read 58 MB — and they
+are read in place, never copied.
+
+### Getting the weights
+
+They are not in this repository — 58 MB, and not ours to redistribute:
+
+```bash
+mkdir -p assets
+curl -L -o assets/model.bin \
+  https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+curl -L -o assets/tokenizer.bin \
+  https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
+```
+
+The build packs both into the ramdisk automatically. Without them the OS boots
+exactly as before and `llm` says the model is missing.
+
+### Three things this cost
+
+**The CPU cannot do arithmetic when it boots.** x86_64 comes up with the FPU
+*emulated* — a setting inherited from when the FPU was a chip you might not have
+bought. An SSE instruction in that state raises an exception rather than
+computing anything. Four bits fix it (`CR0.EM`, `CR0.MP`, `CR4.OSFXSR`,
+`CR4.OSXMMEXCPT`), and `fpu` shows them.
+
+**Enabling it late kills the machine silently.** LLVM does not reserve XMM
+registers for float math — it uses them for ordinary struct and memory copies
+too. So SSE instructions appear in code that has nothing to do with arithmetic,
+including the code that would print a complaint. `fpu::init()` is now the very
+first thing `kernel_main` does.
+
+**The stock target forbids hardware float entirely.** `x86_64-unknown-none`
+ships `+soft-float` with SSE off, and carries `rustc-abi: softfloat`, which pins
+floats to general-purpose registers. `x86_64-5am_os.json` drops that field so
+the normal SysV ABI applies, which is what SSE code expects. No precompiled
+`core` exists for a custom target, hence `build-std` — and a slower first build.
+
+### What it knows
+
+Nothing about this kernel. It was trained on children's stories:
+
+```
+5am> llm once upon a time there was a little robot
+
+once upon a time there was a little robot. He was very happy and loved to
+play. One day he was playing in the park when he saw a big, shiny ball. He
+wanted to play with it, so he ran over to it.
+But when he got close, he saw that it was a big, scary monster! The robot was
+so scared that he started to cry.
+The monster said, "Don't be scared
+
+[llm ] 96 tokens in ~13 s (237 ticks) -- 15M params, 6 layers
+```
+
+That is greedy decoding — always the most likely next token — which is why it
+is deterministic and occasionally repetitive. Sampling with a temperature is a
+small change to `argmax` in `llm.rs`.
+
+Ask it about a page fault and it will invent something confident and wrong. That
+is the honest split in this OS, and both halves are deliberate:
+
+| | `ask` | `llm` |
+| --- | --- | --- |
+| What it is | keyword matching + hardware decoders | a real transformer |
+| Correct? | yes, it reads the registers | often not |
+| Can generalise? | no, only what it was taught | yes, to anything |
+| Good for | why the machine just crashed | continuing a story |
+
+Neither is pretending to be the other, and the code says so in both module docs.
+
+**Speed.** About 7 tokens/second on x86 emulated under TCG on an ARM Mac —
+faster than expected for a scalar matmul with no SIMD beyond what the compiler
+finds. Boot takes ~90 seconds, almost all of it the bootloader pulling 58 MB
+through BIOS disk services before the kernel ever runs.
 
 ---
 
