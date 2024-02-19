@@ -40,8 +40,61 @@ brew install qemu          # or your platform's package manager
 ```
 
 That builds the kernel for bare metal, wraps it in a bootable disk image, and
-boots it in QEMU with the serial console attached to your terminal. Quit with
-**Ctrl-A** then **X**.
+boots it in QEMU with the serial console attached to your terminal. **Type
+straight into the terminal** — the shell reads the serial port as well as the
+PS/2 keyboard. Quit with **Ctrl-A** then **X**.
+
+`./run.sh --gui` also opens a QEMU window; keystrokes there go to the emulated
+keyboard instead. Both drive the same shell.
+
+The first build compiles `core` from source (see below) and takes a few minutes.
+Boot then takes ~90 seconds, almost all of it the bootloader pulling 58 MB of
+model weights through BIOS disk services before the kernel ever runs.
+
+---
+
+## Running it somewhere other than QEMU
+
+`5am-os-bios.img` is a **real BIOS-bootable disk image**, not a QEMU-specific
+artifact. It will boot in VirtualBox, VMware, Hyper-V, or off a USB stick on
+actual hardware.
+
+```bash
+# VirtualBox
+VBoxManage convertfromraw 5am-os-bios.img 5am-os.vdi --format VDI
+
+# VMware
+qemu-img convert -O vmdk 5am-os-bios.img 5am-os.vmdk
+
+# Hyper-V — must be a Generation 1 VM (Gen 2 is UEFI, and the UEFI image
+# is disabled; see Known limitations)
+qemu-img convert -O vpc 5am-os-bios.img 5am-os.vhd
+```
+
+Give the VM **at least 512 MB** of RAM: 58 MB of weights, ~10 MB of static
+buffers, and the kernel itself.
+
+> ### ⚠️ You will see a blank screen unless you attach a serial port
+>
+> This kernel writes **everything** to the serial port. It never draws a single
+> character on the display — there is no VGA text mode and no framebuffer
+> console yet. QEMU hides this because `run.sh` wires COM1 to your terminal.
+>
+> In VirtualBox: **Settings → Serial Ports → Port 1 → Enable**, Port Mode
+> *Raw File* (or *Host Pipe*), and read the output there. VMware and Hyper-V
+> have the same setting under a different name.
+>
+> On real hardware with no serial port, you get a black screen and no way to
+> interact. Writing a framebuffer console is the fix — the bootloader already
+> hands us a framebuffer — and it is the obvious next milestone.
+
+The guest does not care what host it runs on: the kernel is x86_64 and behaves
+identically on macOS, Linux, or Windows. What *is* host-specific is the build
+tooling — `run.sh` is a bash script, so on Windows use WSL2 or Git Bash.
+
+On an x86_64 host with hardware virtualisation (KVM on Linux, WHPX on Windows,
+`-accel hvf` on an Intel Mac) it runs *far* faster than it does here, where an
+ARM Mac is emulating x86 instruction by instruction.
 
 ---
 
@@ -57,6 +110,7 @@ boots it in QEMU with the serial console attached to your terminal. Quit with
 | PIC + timer | working | Why the 8259's defaults collide with Intel's own vectors |
 | PS/2 keyboard | working | Scancodes are not characters; layouts are software |
 | Shell | working | — |
+| Serial console input | working | The same shell over a wire, a window, or SSH |
 | FPU / SSE | working | The CPU boots unable to do float math |
 | Answer engine | working | Decoding hardware beats guessing about it |
 | Transformer (15M) | working | Real inference in ring 0, nothing linked in |

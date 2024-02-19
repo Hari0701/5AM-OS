@@ -87,6 +87,8 @@ const PIC_EOI: u8 = 0x20;
 
 pub const TIMER_VECTOR: u8 = 32;
 pub const KEYBOARD_VECTOR: u8 = 33;
+/// IRQ4 is COM1. Typing into the serial console arrives here.
+pub const SERIAL_VECTOR: u8 = 36;
 
 /// Ticks since boot. Written by the timer interrupt, read by everyone else.
 static mut TICKS: u64 = 0;
@@ -112,6 +114,7 @@ pub unsafe fn init() {
 
         idt[TIMER_VECTOR as usize].set(timer as *const () as u64, 0);
         idt[KEYBOARD_VECTOR as usize].set(keyboard_irq as *const () as u64, 0);
+        idt[SERIAL_VECTOR as usize].set(serial_irq as *const () as u64, 0);
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<[Entry; 256]>() - 1) as u16,
@@ -143,9 +146,10 @@ unsafe fn remap_pic() {
         outb(PIC1_DATA, 0x01);
         outb(PIC2_DATA, 0x01);
 
-        // Mask everything except the timer (IRQ0) and keyboard (IRQ1). A device
-        // we have no handler for would otherwise interrupt us into a fault.
-        outb(PIC1_DATA, 0b1111_1100);
+        // Unmask the timer (IRQ0), keyboard (IRQ1) and COM1 (IRQ4). Everything
+        // else stays masked: a device we have no handler for would otherwise
+        // interrupt us into a fault.
+        outb(PIC1_DATA, 0b1110_1100);
         outb(PIC2_DATA, 0b1111_1111);
     }
 }
@@ -280,6 +284,19 @@ extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
     let scancode = unsafe { inb(0x60) };
     keyboard::push_scancode(scancode);
     unsafe { end_of_interrupt(KEYBOARD_VECTOR) };
+}
+
+extern "x86-interrupt" fn serial_irq(_frame: InterruptStackFrame) {
+    // Drain the FIFO rather than taking one byte: the UART raises a single
+    // interrupt for a burst, so reading once would leave the rest sitting there
+    // until the next keystroke happened to arrive.
+    unsafe {
+        let console = &mut *core::ptr::addr_of_mut!(crate::serial::CONSOLE);
+        while let Some(byte) = console.try_recv() {
+            crate::serial::push_input(byte);
+        }
+        end_of_interrupt(SERIAL_VECTOR);
+    }
 }
 
 /// Where the CPU thinks the IDT is — for `explain idt`.

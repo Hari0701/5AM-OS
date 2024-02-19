@@ -112,6 +112,20 @@ impl SerialPort {
         unsafe { inb(self.base + LINE_STATUS) & 0x20 != 0 }
     }
 
+    /// Ask the UART to raise an interrupt whenever a byte arrives.
+    ///
+    /// Without this the port is write-only in practice: input would have to be
+    /// polled, and anything typed between polls sits in a 16-byte FIFO that
+    /// silently discards the overflow. Paste a line into the terminal and you
+    /// would lose most of it.
+    ///
+    /// # Safety
+    /// The caller must have installed a handler for this port's IRQ first.
+    pub unsafe fn enable_receive_interrupt(&mut self) {
+        // Bit 0 of the interrupt-enable register: "data available".
+        unsafe { outb(self.base + INT_ENABLE, 0x01) };
+    }
+
     /// True when a byte has arrived and is waiting to be read.
     fn has_data(&self) -> bool {
         // Bit 0 of the line status register: "data ready".
@@ -175,6 +189,73 @@ pub static mut CONSOLE: SerialPort = SerialPort::new(COM1);
 
 /// The AI bridge channel. Silent unless something is listening on the other end.
 pub static mut BRIDGE: SerialPort = SerialPort::new(COM2);
+
+/// Bytes that arrived on the console port, filled by the IRQ4 handler.
+///
+/// Same shape as the keyboard queue in keyboard.rs, and volatile for the same
+/// reason: the compiler cannot see that an interrupt writes to it, so without
+/// `read_volatile` it caches the indices and the shell decides, permanently,
+/// that no input ever arrived.
+const INPUT_CAPACITY: usize = 256;
+
+struct InputQueue {
+    buffer: [u8; INPUT_CAPACITY],
+    read: usize,
+    write: usize,
+}
+
+static mut INPUT: InputQueue = InputQueue {
+    buffer: [0; INPUT_CAPACITY],
+    read: 0,
+    write: 0,
+};
+
+/// Called from the serial interrupt handler.
+pub fn push_input(byte: u8) {
+    unsafe {
+        let queue = core::ptr::addr_of_mut!(INPUT);
+        let write = core::ptr::read_volatile(&raw const (*queue).write);
+        let read = core::ptr::read_volatile(&raw const (*queue).read);
+        let next = (write + 1) % INPUT_CAPACITY;
+        if next != read {
+            core::ptr::write_volatile(&raw mut (*queue).buffer[write], byte);
+            core::ptr::write_volatile(&raw mut (*queue).write, next);
+        }
+    }
+}
+
+/// Take one byte typed on the console, if any is waiting.
+pub fn read_input() -> Option<u8> {
+    crate::interrupts::without_interrupts(|| unsafe {
+        let queue = core::ptr::addr_of_mut!(INPUT);
+        let read = core::ptr::read_volatile(&raw const (*queue).read);
+        let write = core::ptr::read_volatile(&raw const (*queue).write);
+        if read == write {
+            return None;
+        }
+        let value = core::ptr::read_volatile(&raw const (*queue).buffer[read]);
+        core::ptr::write_volatile(&raw mut (*queue).read, (read + 1) % INPUT_CAPACITY);
+        Some(value)
+    })
+}
+
+/// Drain and discard whatever the UART is holding.
+///
+/// The FIFO can contain bytes from before the handler existed; without this
+/// the controller may also never raise the first interrupt, exactly as with
+/// the keyboard controller.
+///
+/// # Safety
+/// Talks directly to COM1.
+pub unsafe fn drain_console() {
+    unsafe {
+        let console = &mut *core::ptr::addr_of_mut!(CONSOLE);
+        let mut drained = 0;
+        while console.try_recv().is_some() && drained < 64 {
+            drained += 1;
+        }
+    }
+}
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {

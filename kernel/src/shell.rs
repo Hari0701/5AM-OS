@@ -29,7 +29,7 @@ pub fn run() -> ! {
     prompt();
 
     loop {
-        match keyboard::read_key() {
+        match next_key() {
             Some(Key::Char(c)) => {
                 if len < MAX_LINE {
                     line[len] = c as u8;
@@ -62,10 +62,31 @@ pub fn run() -> ! {
     }
 }
 
+/// Read a keypress from either input device.
+///
+/// The PS/2 keyboard is what you use in a VM window; the serial console is what
+/// you use in a terminal, over SSH, or on a machine with no keyboard. Both feed
+/// the same shell, and neither knows about the other.
+fn next_key() -> Option<Key> {
+    if let Some(byte) = crate::serial::read_input() {
+        return match byte {
+            b'\r' | b'\n' => Some(Key::Enter),
+            // Terminals disagree: most send DEL for backspace, some send BS.
+            0x08 | 0x7F => Some(Key::Backspace),
+            // Printable ASCII. Escape sequences (arrow keys and the like) begin
+            // with 0x1B and are dropped rather than pasted in as garbage.
+            0x20..=0x7E => Some(Key::Char(byte as char)),
+            _ => None,
+        };
+    }
+    keyboard::read_key()
+}
+
 fn banner() {
     println!();
     println!("5AM-OS shell. Everything below reads the live machine.");
     println!("Type `help`, or `explain <topic>` to learn what is under you.");
+    println!("Type here in this terminal, or in the VM window -- both work.");
     println!();
 }
 

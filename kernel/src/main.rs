@@ -85,6 +85,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     narrate::step("ps2 ", "waking the keyboard controller and draining its buffer");
     unsafe { keyboard::init() };
 
+    // Let the serial console be an input device too, not just an output one.
+    // This is what makes the OS usable in a plain terminal -- and over SSH,
+    // and on hardware with no keyboard attached.
+    narrate::step("com1", "accepting input on the serial console as well");
+    unsafe {
+        serial::drain_console();
+        let console = &mut *core::ptr::addr_of_mut!(serial::CONSOLE);
+        console.enable_receive_interrupt();
+    }
+
     // Hand the ramdisk to the model loader. The bootloader has already placed
     // it in memory; there is no filesystem involved and nothing is copied.
     match (boot_info.ramdisk_addr.into_option(), boot_info.ramdisk_len) {
