@@ -127,14 +127,6 @@ fn model() -> Option<&'static Model> {
     unsafe { (*core::ptr::addr_of!(MODEL)).as_ref() }
 }
 
-pub fn is_loaded() -> bool {
-    model().is_some()
-}
-
-pub fn config() -> Option<Config> {
-    model().map(|m| m.config)
-}
-
 // --- loading -------------------------------------------------------------
 
 /// Parse the ramdisk the bootloader placed in memory.

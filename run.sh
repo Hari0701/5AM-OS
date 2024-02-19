@@ -32,6 +32,11 @@ echo "==> booting $IMAGE"
 echo "==> quit with Ctrl-A then X"
 echo
 
+# Headless by default; --gui lets QEMU open its own window.
+#
+# The array is expanded with the `${arr[@]+...}` form because macOS ships bash
+# 3.2, where a plain "${arr[@]}" on an EMPTY array counts as an unset variable
+# and trips `set -u` — so --gui aborted the script before QEMU ever started.
 DISPLAY_ARGS=(-display none)
 if [[ "${1:-}" == "--gui" ]]; then
   DISPLAY_ARGS=()
@@ -50,4 +55,4 @@ exec qemu-system-x86_64 \
   -serial "tcp:127.0.0.1:${BRIDGE_PORT:-4444},server=on,wait=off" \
   -cpu max \
   -m 512M \
-  "${DISPLAY_ARGS[@]}"
+  ${DISPLAY_ARGS[@]+"${DISPLAY_ARGS[@]}"}
