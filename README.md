@@ -8,6 +8,13 @@ reads live CPU state to explain what is under you. `explain gdt` does not print
 a description of a GDT — it asks the CPU where its GDT is, walks it, and decodes
 the bytes that are actually there.
 
+<p align="center">
+  <img src="docs/images/boot.png" alt="5AM-OS booting, drawn on its own framebuffer console" width="620">
+</p>
+
+<p align="center"><em>Booting on its own framebuffer console — every character
+drawn a pixel at a time from a bitmap in <code>font.rs</code>.</em></p>
+
 ```
 5am> explain rings
 PRIVILEGE RINGS
@@ -74,19 +81,11 @@ qemu-img convert -O vpc 5am-os-bios.img 5am-os.vhd
 Give the VM **at least 512 MB** of RAM: 58 MB of weights, ~10 MB of static
 buffers, and the kernel itself.
 
-> ### ⚠️ You will see a blank screen unless you attach a serial port
->
-> This kernel writes **everything** to the serial port. It never draws a single
-> character on the display — there is no VGA text mode and no framebuffer
-> console yet. QEMU hides this because `run.sh` wires COM1 to your terminal.
->
-> In VirtualBox: **Settings → Serial Ports → Port 1 → Enable**, Port Mode
-> *Raw File* (or *Host Pipe*), and read the output there. VMware and Hyper-V
-> have the same setting under a different name.
->
-> On real hardware with no serial port, you get a black screen and no way to
-> interact. Writing a framebuffer console is the fix — the bootloader already
-> hands us a framebuffer — and it is the obvious next milestone.
+Output goes to **both** the screen and the serial port, and input is accepted
+from **both** the keyboard and the serial port — so a VM with no serial
+configured works exactly as you would expect, and a headless one still does too.
+Serial remains the primary console because it works before the display is
+claimed and keeps working when the display does not.
 
 The guest does not care what host it runs on: the kernel is x86_64 and behaves
 identically on macOS, Linux, or Windows. What *is* host-specific is the build
@@ -111,6 +110,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | PS/2 keyboard | working | Scancodes are not characters; layouts are software |
 | Shell | working | — |
 | Serial console input | working | The same shell over a wire, a window, or SSH |
+| Framebuffer console | working | Below a terminal there are only pixels |
 | FPU / SSE | working | The CPU boots unable to do float math |
 | Answer engine | working | Decoding hardware beats guessing about it |
 | Transformer (15M) | working | Real inference in ring 0, nothing linked in |
@@ -168,6 +168,10 @@ PAGING -- why your addresses are fiction
   ...
 ```
 
+<p align="center">
+  <img src="docs/images/ask.png" alt="the ask command explaining paging with the live CR3 value" width="520">
+</p>
+
 **It is not a model, and it says so** — run `ask how do you work`. It is keyword
 matching over a hand-written corpus plus decoders that read live registers.
 Every sentence was written by a human; every number came out of the hardware a
@@ -190,6 +194,10 @@ That trade is deliberate. What it gives up in flexibility it gains in being
        Most likely cause, judging by the address:
        a null pointer dereference. Something unwrapped a null.
 ```
+
+<p align="center">
+  <img src="docs/images/fault.png" alt="5AM-OS diagnosing its own null pointer dereference" width="610">
+</p>
 
 It decodes the real error-code bits and classifies the real faulting address, so
 it distinguishes a null dereference from an unmapped page from a malformed
@@ -277,6 +285,10 @@ The monster said, "Don't be scared
 
 [llm ] 96 tokens in ~13 s (237 ticks) -- 15M params, 6 layers
 ```
+
+<p align="center">
+  <img src="docs/images/llm.png" alt="a 15M-parameter transformer generating a story inside the kernel" width="900">
+</p>
 
 That is greedy decoding — always the most likely next token — which is why it
 is deterministic and occasionally repetitive. Sampling with a temperature is a
@@ -375,6 +387,8 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   keyboard.rs    PS/2 scancodes -> characters
   shell.rs       the REPL, and every `explain` topic
   narrate.rs     the teaching layer for boot
+  framebuffer.rs a text console drawn pixel by pixel
+  font.rs        an 8x16 bitmap font, generated and committed as data
   ai.rs          the serial protocol for talking to a model
 bridge/          runs on your machine: serial <-> Claude API
 boot/            runs on your machine: wraps the kernel in a disk image

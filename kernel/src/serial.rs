@@ -265,6 +265,25 @@ pub fn _print(args: fmt::Arguments) {
         let console = &mut *core::ptr::addr_of_mut!(CONSOLE);
         let _ = console.write_fmt(args);
     }
+
+    // Everything also goes to the screen, when there is one. Serial stays the
+    // primary channel because it works before the framebuffer is mapped and
+    // keeps working when the display does not -- but a machine booted off a USB
+    // stick with no serial cable now shows its output.
+    if crate::framebuffer::is_active() {
+        let mut screen = ScreenWriter;
+        let _ = screen.write_fmt(args);
+    }
+}
+
+/// Adapter so the same `format_args!` can be replayed to the framebuffer.
+struct ScreenWriter;
+
+impl fmt::Write for ScreenWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        crate::framebuffer::write_str(s);
+        Ok(())
+    }
 }
 
 #[macro_export]

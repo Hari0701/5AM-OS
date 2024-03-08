@@ -13,7 +13,9 @@
 #![feature(abi_x86_interrupt)] // Lets us write interrupt handlers as plain fns.
 
 mod ai;
+mod font;
 mod fpu;
+mod framebuffer;
 mod gdt;
 mod interrupts;
 mod llm;
@@ -50,6 +52,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Enable it later and the machine dies silently mid-boot, which is exactly
     // what happened the first time this was written.
     unsafe { fpu::init() };
+
+    // Claim the display before anything else touches boot_info. `take()` needs
+    // the mutable reference, and everything after this line only has a shared
+    // one -- so this has to happen here or not at all.
+    if let Some(buffer) = boot_info.framebuffer.take() {
+        let info = buffer.info();
+        unsafe { framebuffer::init(buffer.into_buffer(), info) };
+    }
 
     // Downgrade to a shared reference: nothing mutates the boot info again.
     let boot_info: &'static BootInfo = boot_info;

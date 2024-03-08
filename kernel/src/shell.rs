@@ -106,12 +106,20 @@ fn execute(command: &str) {
         "mem" => mem(),
         "uptime" => uptime(),
         "fpu" => fpu_check(),
+        "screen" => screen(),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
         "fault" => fault(rest),
         "ask" => ask(rest),
         "bridge" => bridge(rest),
-        "clear" => print!("\x1b[2J\x1b[H"),
+        "clear" => {
+            // Two different displays, two different ways to clear. The escape
+            // sequence means something to a terminal on the other end of the
+            // serial port; the framebuffer has never heard of ANSI and would
+            // just draw the characters.
+            print!("\x1b[2J\x1b[H");
+            crate::framebuffer::clear();
+        }
         other => {
             println!("unknown command: {other}");
             println!("try `help`");
@@ -138,6 +146,7 @@ fn help() {
     println!("  mem               physical memory map from the firmware");
     println!("  uptime            timer ticks since boot");
     println!("  fpu               is floating point on, and does it work?");
+    println!("  screen            the framebuffer this text is drawn on");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
     println!("                    NOT know anything about this kernel.");
@@ -358,6 +367,24 @@ fn mem() {
     }
     println!();
     println!("  {} MiB usable across {} regions.", usable / 1024 / 1024, info.memory_regions.len());
+}
+
+/// Describe the display we are drawing on.
+fn screen() {
+    match crate::framebuffer::info() {
+        None => {
+            println!("  No framebuffer. This output is going to the serial port");
+            println!("  only -- which is why serial stays the primary console.");
+        }
+        Some((width, height, columns, rows)) => {
+            println!("  {width}x{height} pixels, {columns}x{rows} characters.");
+            println!();
+            println!("  There is no text mode here. The hardware knows only");
+            println!("  pixels; every character on this screen was drawn one");
+            println!("  pixel at a time from a 16-byte bitmap in font.rs, and");
+            println!("  the screen scrolls by copying itself upward.");
+        }
+    }
 }
 
 /// Run the in-kernel transformer.
