@@ -19,6 +19,7 @@ mod framebuffer;
 mod gdt;
 mod interrupts;
 mod llm;
+mod memory;
 mod keyboard;
 mod narrate;
 mod oracle;
@@ -116,6 +117,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial::drain_console();
         let console = &mut *core::ptr::addr_of_mut!(serial::CONSOLE);
         console.enable_receive_interrupt();
+    }
+
+    // Memory management, in the only order that works: know which frames are
+    // free, then map some of them, then hand out pieces of what you mapped.
+    match boot_info.physical_memory_offset.into_option() {
+        Some(offset) => {
+            narrate::step("mem ", "building the physical frame allocator");
+            unsafe { memory::init(&boot_info.memory_regions, offset) };
+
+        None => println!("[mem ] no physical memory mapping -- allocator disabled"),
     }
 
     // Hand the ramdisk to the model loader. The bootloader has already placed
