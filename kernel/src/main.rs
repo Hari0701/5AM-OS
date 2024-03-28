@@ -34,7 +34,20 @@ use core::panic::PanicInfo;
 // bootloader expects. Getting this wrong by hand is a triple fault with no
 // error message, which is the classic first day of OS development.
 // (Plain comments, not doc comments: rustdoc cannot document a macro call.)
-bootloader_api::entry_point!(kernel_main);
+/// Ask the bootloader to map all of physical memory before we start.
+///
+/// Without this, the kernel cannot read its own page tables: entries hold
+/// physical addresses, and there would be no virtual address that reaches them.
+/// See the module comment in memory.rs — this one line is what makes paging
+/// implementable at all.
+pub static BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
+    let mut config = bootloader_api::BootloaderConfig::new_default();
+    config.mappings.physical_memory =
+        Some(bootloader_api::config::Mapping::Dynamic);
+    config
+};
+
+bootloader_api::entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// The first Rust code that runs in 5AM-OS.
 ///
