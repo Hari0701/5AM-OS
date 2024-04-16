@@ -4,9 +4,17 @@
 //! *there* — the bootloader had mapped what we needed and we used it. This is
 //! where the kernel starts managing memory instead of inheriting it.
 //!
-//! This half is **allocation**: deciding which physical frames are free. That
-//! is pure bookkeeping. Mapping -- telling the CPU that a virtual address
-//! resolves to one of those frames -- is a separate problem, and comes next.
+//! Two jobs, and they are commonly confused:
+//!
+//!   * **Allocation** is deciding which physical frames are free. That is
+//!     bookkeeping, and it lives in [`FrameAllocator`].
+//!   * **Mapping** is telling the CPU that a virtual address should resolve to
+//!     a particular physical frame. That means editing the page tables, and it
+//!     lives in [`map_page`].
+//!
+//! You need both, and they are independent: a frame can be allocated and
+//! unmapped (memory you own but cannot reach), or mapped without being
+//! allocated (which is how you corrupt something else's data).
 //!
 //! ## Reaching the page tables at all
 //!
@@ -24,6 +32,7 @@
 
 use crate::println;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use core::arch::asm;
 
 /// x86_64 pages are 4KiB. Everything here is in units of that.
 pub const PAGE_SIZE: usize = 4096;
@@ -132,3 +141,104 @@ pub unsafe fn init(regions: &MemoryRegions, physical_offset: u64) {
         allocator.total * PAGE_SIZE / 1024 / 1024
     );
 }
+
+// --- page tables ---------------------------------------------------------
+
+const PRESENT: u64 = 1 << 0;
+const WRITABLE: u64 = 1 << 1;
+/// Bits 12..51 of an entry are the physical address of the next table.
+const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+fn read_cr3() -> u64 {
+    let cr3: u64;
+    unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
+    cr3 & ADDRESS_MASK
+}
+
+/// Split a virtual address into the four table indexes the CPU uses.
+///
+/// This is the whole of address translation, in one function: nine bits per
+/// level, four levels, then a twelve-bit offset into the frame.
+fn indexes(address: u64) -> [usize; 4] {
+    [
+        ((address >> 39) & 0x1FF) as usize, // level 4
+        ((address >> 30) & 0x1FF) as usize, // level 3
+        ((address >> 21) & 0x1FF) as usize, // level 2
+        ((address >> 12) & 0x1FF) as usize, // level 1
+    ]
+}
+
+/// Map `virtual_address` to `frame`, creating any missing tables on the way.
+///
+/// # Safety
+/// Editing live page tables. A wrong entry here does not fault — it silently
+/// points at someone else's memory.
+pub unsafe fn map_page(virtual_address: u64, frame: u64, flags: u64) -> Result<(), &'static str> {
+    let indexes = indexes(virtual_address);
+    let mut table = read_cr3();
+
+    // Walk levels 4, 3 and 2, creating tables where the path does not exist.
+    for level in 0..3 {
+        let entry_ptr = (physical_to_virtual(table) as *mut u64).add(indexes[level]);
+        let entry = unsafe { *entry_ptr };
+
+        table = if entry & PRESENT != 0 {
+            entry & ADDRESS_MASK
+        } else {
+            let new = allocator().allocate().ok_or("out of physical memory")?;
+            // A fresh table must be zeroed, or its garbage reads as present
+            // entries pointing at arbitrary physical addresses.
+            unsafe {
+                core::ptr::write_bytes(physical_to_virtual(new) as *mut u8, 0, PAGE_SIZE);
+                *entry_ptr = new | PRESENT | WRITABLE;
+            }
+            new
+        };
+    }
+
+    // Level 1: the entry that actually names the frame.
+    let entry_ptr = (physical_to_virtual(table) as *mut u64).add(indexes[3]);
+    if unsafe { *entry_ptr } & PRESENT != 0 {
+        return Err("that address is already mapped");
+    }
+    unsafe {
+        *entry_ptr = (frame & ADDRESS_MASK) | flags | PRESENT;
+    }
+
+    // The CPU caches translations in the TLB and will happily keep using a
+    // stale one. `invlpg` drops the entry for this page specifically.
+    unsafe {
+        asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
+    }
+    Ok(())
+}
+
+/// Follow the tables by hand and report what a virtual address resolves to.
+///
+/// Used by `translate` in the shell — being able to *see* the walk is most of
+/// the point of implementing it.
+pub fn translate(virtual_address: u64) -> Option<(u64, [u64; 4])> {
+    let indexes = indexes(virtual_address);
+    let mut table = read_cr3();
+    let mut entries = [0u64; 4];
+
+    for level in 0..4 {
+        let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(indexes[level]) };
+        entries[level] = entry;
+        if entry & PRESENT == 0 {
+            return None;
+        }
+        // A set bit 7 at level 3 or 2 means a huge page: the walk stops early
+        // and the rest of the address is the offset.
+        if level < 3 && entry & (1 << 7) != 0 {
+            let size = if level == 1 { 1 << 30 } else { 1 << 21 };
+            let base = entry & ADDRESS_MASK;
+            return Some((base + (virtual_address & (size - 1)), entries));
+        }
+        table = entry & ADDRESS_MASK;
+    }
+
+    Some((table + (virtual_address & 0xFFF), entries))
+}
+
+pub const FLAG_WRITABLE: u64 = WRITABLE;
