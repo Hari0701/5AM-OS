@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 cargo build --package kernel \
   --target x86_64-5am_os.json \
   -Z json-target-spec \
-  -Z build-std=core,compiler_builtins \
+  -Z build-std=core,compiler_builtins,alloc \
   -Z build-std-features=compiler-builtins-mem \
   --release
 

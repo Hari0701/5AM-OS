@@ -13,10 +13,13 @@
 #![feature(abi_x86_interrupt)] // Lets us write interrupt handlers as plain fns.
 
 mod ai;
+extern crate alloc;
+
 mod font;
 mod fpu;
 mod framebuffer;
 mod gdt;
+mod heap;
 mod interrupts;
 mod llm;
 mod memory;
@@ -126,6 +129,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             narrate::step("mem ", "building the physical frame allocator");
             unsafe { memory::init(&boot_info.memory_regions, offset) };
 
+            narrate::step("heap", "mapping a heap -- Vec and String work after this line");
+            match unsafe { heap::init() } {
+                Ok(()) => {}
+                Err(reason) => println!("[heap] failed: {reason}"),
+            }
+        }
         None => println!("[mem ] no physical memory mapping -- allocator disabled"),
     }
 
