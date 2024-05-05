@@ -12,8 +12,11 @@
 //!      page of it. That is [`init`], and it uses `memory.rs`.
 //!   2. Hand out pieces of that range on request. That is [`LinkedListAllocator`].
 //!
-//! The design is a free list of holes: `alloc` finds one big enough and splits
-//! it, `dealloc` pushes the freed range back onto the list.
+//! The design is a free list of holes kept sorted by address, with adjacent
+//! holes merged back together on free. The sorting exists purely to make that
+//! merge possible — without it, freeing a thousand small allocations leaves a
+//! thousand holes that can never recombine, and a later large allocation fails
+//! with megabytes nominally free.
 //!
 //! It is emphatically not fast. Allocation is O(number of holes) and there is no
 //! size binning, no per-CPU cache, and no locking beyond disabling interrupts.
@@ -33,6 +36,13 @@ pub const HEAP_START: u64 = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 /// A free region, with the list threaded through the free memory itself.
+///
+/// The list is kept **sorted by address**, which is what makes coalescing
+/// possible: two holes can only be merged if they are adjacent, and you can
+/// only cheaply notice adjacency if neighbours in the list are neighbours in
+/// memory. An unsorted list is simpler and degrades — free a thousand small
+/// allocations and you have a thousand holes that will never recombine, so a
+/// later large allocation fails with megabytes free.
 struct Hole {
     size: usize,
     next: *mut Hole,
@@ -53,6 +63,7 @@ pub struct LinkedListAllocator {
     live_allocations: usize,
 }
 
+// The allocator is only ever touched with interrupts disabled on a single CPU.
 unsafe impl Send for LinkedListAllocator {}
 
 impl LinkedListAllocator {
@@ -64,17 +75,47 @@ impl LinkedListAllocator {
         }
     }
 
-    /// Return a region to the free list.
+    /// Return a region to the free list, merging it with its neighbours.
     ///
     /// # Safety
     /// The range must be mapped, writable, and not already free.
     unsafe fn add_region(&mut self, address: usize, size: usize) {
+        debug_assert_eq!(align_up(address, align_of::<Hole>()), address);
+        debug_assert!(size >= size_of::<Hole>());
+
         let hole = address as *mut Hole;
         unsafe {
             (*hole).size = size;
-            (*hole).next = self.head;
+            (*hole).next = core::ptr::null_mut();
         }
-        self.head = hole;
+
+        // Find the insertion point: the last hole that starts before this one.
+        let mut previous: *mut Hole = core::ptr::null_mut();
+        let mut current = self.head;
+        while !current.is_null() && (current as usize) < address {
+            previous = current;
+            current = unsafe { (*current).next };
+        }
+
+        unsafe {
+            (*hole).next = current;
+            if previous.is_null() {
+                self.head = hole;
+            } else {
+                (*previous).next = hole;
+            }
+
+            // Merge forward: this hole runs directly into the next one.
+            if !current.is_null() && (*hole).end() == current as usize {
+                (*hole).size += (*current).size;
+                (*hole).next = (*current).next;
+            }
+            // Merge backward: the previous hole runs directly into this one.
+            if !previous.is_null() && (*previous).end() == address {
+                (*previous).size += (*hole).size;
+                (*previous).next = (*hole).next;
+            }
+        }
     }
 
     /// Find a hole big enough, split it, and unlink what we took.
@@ -88,12 +129,14 @@ impl LinkedListAllocator {
                     unsafe { ((*current).start(), (*current).end()) };
                 let next = unsafe { (*current).next };
 
+                // Unlink it; any leftover on either side is added back below.
                 if previous.is_null() {
                     self.head = next;
                 } else {
                     unsafe { (*previous).next = next };
                 }
 
+                // Alignment can leave a gap in front of the allocation.
                 if start > region_start {
                     unsafe { self.add_region(region_start, start - region_start) };
                 }
