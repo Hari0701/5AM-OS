@@ -107,6 +107,8 @@ fn execute(command: &str) {
         "uptime" => uptime(),
         "fpu" => fpu_check(),
         "screen" => screen(),
+        "heap" => heap_status(),
+        "translate" => translate(rest),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
         "fault" => fault(rest),
@@ -147,6 +149,8 @@ fn help() {
     println!("  uptime            timer ticks since boot");
     println!("  fpu               is floating point on, and does it work?");
     println!("  screen            the framebuffer this text is drawn on");
+    println!("  heap              the allocator, proved with a live Vec");
+    println!("  translate <addr>  walk the page tables for an address");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
     println!("                    NOT know anything about this kernel.");
@@ -367,6 +371,129 @@ fn mem() {
     }
     println!();
     println!("  {} MiB usable across {} regions.", usable / 1024 / 1024, info.memory_regions.len());
+}
+
+/// Show the allocator working, rather than asserting that it does.
+fn heap_status() {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::fmt::Write;
+
+    let (free_frames, total_frames) = crate::memory::allocator().stats();
+    println!("  physical frames : {free_frames} free of {total_frames}");
+    println!("                    ({} MiB still unallocated)",
+        free_frames * crate::memory::PAGE_SIZE / 1024 / 1024);
+
+    let (free, holes, live) = crate::heap::stats();
+    println!("  heap            : {free} bytes free in {holes} hole(s), {live} live allocation(s)");
+    println!("                    mapped at {:#x}, {} KiB",
+        crate::heap::HEAP_START, crate::heap::HEAP_SIZE / 1024);
+    println!();
+
+    // The proof. None of this could have been written anywhere in this kernel
+    // before the allocator existed -- there was no way to have a growable
+    // anything.
+    let mut values: Vec<u32> = Vec::new();
+    for i in 1..=8 {
+        values.push(i * i);
+    }
+    let mut text = String::new();
+    let _ = write!(text, "{:?}", values);
+
+    println!("  A Vec, grown at runtime : {text}");
+    println!("  Its heap address        : {:p}", values.as_ptr());
+
+    let (after, _, live_after) = crate::heap::stats();
+    println!("  Heap free while held    : {after} bytes, {live_after} live");
+
+    drop(values);
+    drop(text);
+    let (recovered, holes_end, live_end) = crate::heap::stats();
+    println!("  After dropping them     : {recovered} bytes, {live_end} live");
+    println!();
+
+    // The real test of an allocator is not that it allocates -- it is that the
+    // free list survives churn. Without coalescing, this loop leaves hundreds
+    // of unmergeable holes and the hole count below climbs with every run.
+    let before = crate::heap::stats();
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    for round in 0..400 {
+        let size = 16 + (round * 37) % 512;
+        let block = alloc::vec![round as u8; size];
+        // Keep every third block, drop the rest -- interleaving is what
+        // actually fragments a heap; allocating then freeing in order does not.
+        if round % 3 == 0 {
+            kept.push(block);
+        }
+    }
+    let mid = crate::heap::stats();
+    drop(kept);
+    let after = crate::heap::stats();
+
+    println!("  400 alloc/free cycles, interleaved:");
+    println!("    before : {} bytes free, {} hole(s)", before.0, before.1);
+    println!("    during : {} bytes free, {} hole(s)", mid.0, mid.1);
+    println!("    after  : {} bytes free, {} hole(s)", after.0, after.1);
+    println!();
+    if after.0 == before.0 && after.1 <= before.1 {
+        println!("  Every byte came back and the holes merged back into one.");
+        println!("  That is coalescing working: without it the hole count would");
+        println!("  climb on every run until a large allocation could not fit.");
+    } else {
+        println!("  LEAK or FRAGMENTATION: the heap did not return to its");
+        println!("  starting state. {} bytes and {} hole(s) unaccounted for.",
+            before.0 as i64 - after.0 as i64, after.1 as i64 - before.1 as i64);
+    }
+    let _ = (holes_end, live_end);
+}
+
+/// Walk the page tables for an address, showing every level.
+fn translate(argument: &str) {
+    let address = match parse_hex(argument) {
+        Some(value) => value,
+        None => {
+            println!("  usage: translate <hex address>");
+            println!();
+            println!("  Try `translate {:#x}` for the heap, or the RSP value", crate::heap::HEAP_START);
+            println!("  from `regs` to see where your own stack lives.");
+            return;
+        }
+    };
+
+    println!("  virtual {address:#018x}");
+    println!();
+    match crate::memory::translate(address) {
+        None => {
+            println!("  Not mapped. Nothing in the tree rooted at CR3 covers it,");
+            println!("  which is exactly what a page fault would tell you.");
+        }
+        Some((physical, entries)) => {
+            let names = ["level 4", "level 3", "level 2", "level 1"];
+            for (name, entry) in names.iter().zip(entries.iter()) {
+                if *entry == 0 {
+                    continue;
+                }
+                println!(
+                    "    {name}  entry {entry:#018x}  -> frame {:#x}{}",
+                    entry & 0x000f_ffff_ffff_f000,
+                    if entry & (1 << 1) != 0 { " writable" } else { " read-only" },
+                );
+            }
+            println!();
+            println!("  physical {physical:#018x}");
+            println!();
+            println!("  Four table reads to resolve one address. That is what");
+            println!("  the TLB caches, and why a TLB miss is expensive.");
+        }
+    }
+}
+
+fn parse_hex(text: &str) -> Option<u64> {
+    let text = text.trim().trim_start_matches("0x");
+    if text.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(text, 16).ok()
 }
 
 /// Describe the display we are drawing on.
