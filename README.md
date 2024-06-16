@@ -111,11 +111,13 @@ ARM Mac is emulating x86 instruction by instruction.
 | Shell | working | — |
 | Serial console input | working | The same shell over a wire, a window, or SSH |
 | Framebuffer console | working | Below a terminal there are only pixels |
+| Physical frame allocator | working | The free list lives inside the free memory |
+| Page tables | working | Four table reads to resolve one address |
+| Heap allocator | working | The line where `Vec` and `String` start existing |
 | FPU / SSE | working | The CPU boots unable to do float math |
 | Answer engine | working | Decoding hardware beats guessing about it |
 | Transformer (15M) | working | Real inference in ring 0, nothing linked in |
 | AI bridge (COM2) | optional | Serial is the kernel's only reach into the outside world |
-| Paging / allocator | not yet | |
 | Multitasking | not yet | |
 
 ### Shell commands
@@ -208,6 +210,62 @@ Writing `fault wild` taught the engine something true: a non-canonical address
 raises a **general protection fault**, not a page fault, because the CPU rejects
 the pointer shape before it ever consults the page tables. `#GP` carries no CR2,
 so the engine reads the error code's selector fields instead.
+
+---
+
+## Memory management
+
+This is the part that turns a booting machine into something that can host
+programs, and it is three separate ideas that get conflated:
+
+**Knowing which memory is free.** The firmware hands over a fragmented map of
+physical RAM; `memory.rs` walks it and threads a free list *through the free
+frames themselves* — each free frame's first eight bytes hold the address of the
+next one. That costs zero bookkeeping memory, which matters because at that
+point in boot there is nowhere to put any.
+
+**Making an address mean something.** Page table entries hold *physical*
+addresses, but every address the kernel uses is virtual — so to read the table
+whose address is in CR3, you need a virtual address that reaches it, and you
+cannot make one without first reading the table. The escape is to have the
+bootloader map all of physical memory at a known offset before the kernel
+starts. That one config line is what makes paging implementable at all.
+
+**Handing out pieces.** `heap.rs` maps 2 MiB and manages it with an
+address-sorted free list that merges adjacent holes on free.
+
+```
+5am> heap
+  physical frames : 110420 free of 110936
+  heap            : 2097152 bytes free in 1 hole(s), 0 live allocation(s)
+
+  A Vec, grown at runtime : [1, 4, 9, 16, 25, 36, 49, 64]
+  Its heap address        : 0x444444440010
+
+  400 alloc/free cycles, interleaved:
+    before : 2097152 bytes free, 1 hole(s)
+    during : 2054160 bytes free, 3 hole(s)
+    after  : 2097152 bytes free, 1 hole(s)
+```
+
+That last block is the test that matters. An allocator that allocates is easy;
+one whose free list survives churn is the point. The first version here did not
+coalesce — `free` just pushed onto the head of the list — and it would have
+degraded until a large allocation failed with megabytes nominally free.
+
+You can also watch a translation happen:
+
+```
+5am> translate 444444440000
+    level 4  entry 0x000000001ffde023  -> frame 0x1ffde000 writable
+    level 3  entry 0x000000001ffdd023  -> frame 0x1ffdd000 writable
+    level 2  entry 0x000000001ffdc023  -> frame 0x1ffdc000 writable
+    level 1  entry 0x000000001ffdf063  -> frame 0x1ffdf000 writable
+
+  physical 0x000000001ffdf000
+```
+
+Four table reads for one address. That is what the TLB caches.
 
 ---
 
@@ -390,6 +448,8 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   framebuffer.rs a text console drawn pixel by pixel
   font.rs        an 8x16 bitmap font, generated and committed as data
   ai.rs          the serial protocol for talking to a model
+  memory.rs      physical frames and the page tables
+  heap.rs        the allocator behind Vec, String and Box
 bridge/          runs on your machine: serial <-> Claude API
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
@@ -410,8 +470,6 @@ because reading it is the point.
 - **The mode switch is borrowed.** Real mode → protected → long mode is done by
   the `bootloader` crate, not by us. That is the most interesting part of boot,
   and writing our own stage is on the list.
-- **No memory allocator.** Everything is fixed-size buffers and statics. That is
-  why there is no `String` anywhere in this codebase.
 - **Single core, no scheduler.** One thread of execution, forever.
 - **The AI bridge needs a host process.** The kernel cannot reach a network by
   itself yet, so `ask` talks to `bridge/bridge.py` over a serial port rather
