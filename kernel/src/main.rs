@@ -28,6 +28,7 @@ mod narrate;
 mod oracle;
 mod serial;
 mod shell;
+mod task;
 
 use bootloader_api::BootInfo;
 use core::panic::PanicInfo;
@@ -147,6 +148,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
         _ => narrate::step("llm ", "no ramdisk -- booting without the model"),
     }
+
+    narrate::step("task", "registering the shell as task 0 -- preemption on");
+    task::init();
 
     narrate::step("sti", "enabling interrupts — the machine can now interrupt us");
     interrupts::enable();

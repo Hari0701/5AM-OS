@@ -90,8 +90,13 @@ pub const KEYBOARD_VECTOR: u8 = 33;
 /// IRQ4 is COM1. Typing into the serial console arrives here.
 pub const SERIAL_VECTOR: u8 = 36;
 
-/// Ticks since boot. Written by the timer interrupt, read by everyone else.
-static mut TICKS: u64 = 0;
+/// Ticks since boot.
+///
+/// Incremented by the assembly in task.rs rather than by Rust, now that the
+/// timer entry is written by hand — hence no_mangle, so `inc qword ptr` can
+/// name it.
+#[unsafe(no_mangle)]
+pub static mut TICKS: u64 = 0;
 
 pub fn ticks() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TICKS)) }
@@ -112,7 +117,10 @@ pub unsafe fn init() {
         idt[13].set(general_protection as *const () as u64, 0);
         idt[14].set(page_fault as *const () as u64, 0);
 
-        idt[TIMER_VECTOR as usize].set(timer as *const () as u64, 0);
+        // The timer is the one handler not written in Rust: preemption means
+        // returning onto a different stack, which needs an exactly known
+        // register layout. See task.rs.
+        idt[TIMER_VECTOR as usize].set(crate::task::timer_entry as *const () as u64, 0);
         idt[KEYBOARD_VECTOR as usize].set(keyboard_irq as *const () as u64, 0);
         idt[SERIAL_VECTOR as usize].set(serial_irq as *const () as u64, 0);
 
@@ -267,14 +275,6 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _error: u64) 
     println!();
     crate::oracle::explain_fault("double_fault", frame.rip, 0, 0);
     crate::halt_forever();
-}
-
-extern "x86-interrupt" fn timer(_frame: InterruptStackFrame) {
-    unsafe {
-        let ticks = core::ptr::addr_of_mut!(TICKS);
-        core::ptr::write_volatile(ticks, core::ptr::read_volatile(ticks) + 1);
-        end_of_interrupt(TIMER_VECTOR);
-    }
 }
 
 extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
