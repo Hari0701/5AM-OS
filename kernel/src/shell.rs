@@ -55,8 +55,10 @@ pub fn run() -> ! {
             None => {
                 // Nothing typed. Park the CPU until the next interrupt rather
                 // than spinning — this is the difference between a laptop with
-                // a cool fan and one without.
-                unsafe { asm!("hlt", options(nomem, nostack)) };
+                // a cool fan and one without. With preemption on, the timer
+                // wakes us and may hand the CPU to another task first.
+                crate::task::reap_finished();
+                crate::task::yield_now();
             }
         }
     }
@@ -108,6 +110,8 @@ fn execute(command: &str) {
         "fpu" => fpu_check(),
         "screen" => screen(),
         "heap" => heap_status(),
+        "tasks" => crate::task::report(),
+        "spawn" => spawn(rest),
         "translate" => translate(rest),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
@@ -150,6 +154,9 @@ fn help() {
     println!("  fpu               is floating point on, and does it work?");
     println!("  screen            the framebuffer this text is drawn on");
     println!("  heap              the allocator, proved with a live Vec");
+    println!("  tasks             what is running, and how often it switched");
+    println!("  spawn <prompt>    run the transformer in the background and");
+    println!("                    keep using the shell while it thinks");
     println!("  translate <addr>  walk the page tables for an address");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
@@ -371,6 +378,24 @@ fn mem() {
     }
     println!();
     println!("  {} MiB usable across {} regions.", usable / 1024 / 1024, info.memory_regions.len());
+}
+
+/// Run the transformer as a separate task.
+fn spawn(prompt: &str) {
+    use alloc::string::ToString;
+    if prompt.is_empty() {
+        println!("  usage: spawn <prompt>");
+        println!();
+        println!("  Same as `llm`, except the shell stays usable while it runs.");
+        println!("  Try it and then type `tasks` while the story is generating.");
+        return;
+    }
+    match crate::task::spawn("llm", prompt.to_string()) {
+        Ok(id) => {
+            println!("  [task {id} started -- the prompt is still yours]");
+        }
+        Err(reason) => println!("  could not spawn: {reason}"),
+    }
 }
 
 /// Show the allocator working, rather than asserting that it does.
