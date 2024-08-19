@@ -122,7 +122,6 @@ pub fn spawn(name: &str, prompt: String) -> Result<usize, &'static str> {
         // kernel that could not have existed before the allocator did.
         let stack: Box<[u8]> = vec![0u8; STACK_SIZE].into_boxed_slice();
         let top = stack.as_ptr() as u64 + STACK_SIZE as u64;
-        // The ABI wants 16-byte alignment at a function's entry.
         let top = top & !0xF;
 
         // Build a stack that looks like a task which was interrupted.
@@ -147,9 +146,24 @@ pub fn spawn(name: &str, prompt: String) -> Result<usize, &'static str> {
 ///
 /// The order here must be the exact reverse of what `timer_entry` pops.
 ///
+/// ## The alignment trap
+///
+/// `top` is 16-byte aligned, and handing that straight to the task is wrong in
+/// a way that takes a fault to discover. The ABI does not say "aligned at entry"
+/// — it says the stack was 16-aligned *before the `call`*, and the call pushed
+/// eight bytes of return address. So a function's first instruction sees
+/// `rsp % 16 == 8`, and the compiler emits `movaps` against that assumption.
+/// Start a task on a 16-aligned stack and every spill is off by eight, which the
+/// CPU reports as a #GP with error code 0 — not the alignment complaint you
+/// would hope for.
+///
 /// # Safety
-/// `top` must be the top of a stack big enough for the frame.
+/// `top` must be the 16-aligned top of a stack big enough for the frame.
 unsafe fn build_frame(top: u64, entry: u64) -> u64 {
+    // Where the task's own RSP starts: one slot down, standing where a return
+    // address would be if anyone had called it. Nothing reads that slot —
+    // `task_entry` never returns — it exists purely to fix the alignment.
+    let task_rsp = top - 8;
     let mut sp = top;
     let mut push = |value: u64| {
         sp -= 8;
@@ -158,7 +172,7 @@ unsafe fn build_frame(top: u64, entry: u64) -> u64 {
 
     // What the CPU pushes on an interrupt, in the order it pushes it.
     push(0);                       // SS: 0 is legal for a ring-0 iretq
-    push(top);                     // RSP the task resumes with
+    push(task_rsp);                // RSP the task resumes with
     push(0x202);                   // RFLAGS: interrupts enabled, reserved bit
     push(gdt::KERNEL_CODE as u64); // CS
     push(entry);                   // RIP — where the task begins
