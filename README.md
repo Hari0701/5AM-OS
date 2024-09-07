@@ -118,7 +118,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Answer engine | working | Decoding hardware beats guessing about it |
 | Transformer (15M) | working | Real inference in ring 0, nothing linked in |
 | AI bridge (COM2) | optional | Serial is the kernel's only reach into the outside world |
-| Multitasking | not yet | |
+| Preemptive multitasking | working | A task is register values plus a stack, nothing more |
 
 ### Shell commands
 
@@ -135,6 +135,8 @@ fault <kind>      break something: int3 | div0 | page | null | wild | stack
 ask <question>    ask the kernel about itself -- answered inside this
                   machine, no network and no host process
 bridge <question> send the question to a host process over COM2 instead
+tasks             every task slot, its state and how often it was switched to
+spawn <prompt>    run a generation on its own stack and keep your prompt
 clear             clear the screen
 ```
 
@@ -266,6 +268,78 @@ You can also watch a translation happen:
 ```
 
 Four table reads for one address. That is what the TLB caches.
+
+---
+
+## Doing two things at once
+
+The transformer takes about fifteen seconds to answer. For most of this
+project's life that meant the machine was simply gone for fifteen seconds --
+keystrokes still reached the interrupt handler and piled up in a buffer, but
+nothing read them, because the shell *was* the code running the transformer.
+
+`task.rs` fixes that, and the fix is smaller than it sounds. **A task is
+register values plus a stack.** To switch, you push every register onto the
+stack you are on, remember that stack pointer, load a different one, and pop.
+The pops restore somebody else's registers, and execution continues as them.
+
+The timer interrupt is the only handler here not written with Rust's
+`extern "x86-interrupt"` ABI. That ABI writes its own prologue and epilogue,
+which is correct when a handler returns to whatever it interrupted -- and
+useless when the entire point is to return somewhere else. So vector 32 is
+hand-written assembly that pushes fifteen registers in a known order, passes
+`rsp` to Rust, and resumes on whatever Rust passes back:
+
+```
+mov rdi, rsp
+call schedule
+mov rsp, rax
+```
+
+Three instructions. That is multitasking.
+
+A brand-new task has no saved registers, so `spawn` forges some: a fake
+interrupt frame with the entry point where the return address goes, and zeros
+below it. The first switch pops the zeros and `iretq`s into a function nobody
+ever called.
+
+```
+5am> spawn once upon a time there was a small robot
+  [task 1 started -- the prompt is still yours]
+5am>
+once upon a time there was a small robot. He was very happytasks
+  id  name      state     switches
+  0   shell     running   46
+  1   llm       ready     46
+5am>  and loved to play. One day he was playing in the park when he sawuptime
+  223 ticks  (~12 seconds at the PIT's default 18.2 Hz)
+5am>  a little girl. She was playing with a ball and the robot wanted to playtasks
+  id  name      state     switches
+  0   shell     running   137
+  1   llm       ready     137
+```
+
+The output is interleaved because it genuinely is: the network writes a token,
+the timer takes the CPU away mid-sentence, the shell answers you, and the timer
+hands it back. Both counters climb together because a switch away from one is a
+switch into the other.
+
+### What this cost
+
+One bug, and it is worth writing down. The first `spawn` faulted immediately --
+`#GP`, error code 0, at an ordinary kernel address. Error code 0 in 64-bit mode
+usually means a non-canonical pointer, so I went looking for corruption that was
+not there.
+
+It was alignment. The SysV ABI does not promise a function 16-byte alignment at
+its first instruction. It promises the stack was 16-aligned *before* the `call`,
+and the `call` pushed eight bytes of return address -- so every function begins
+with `rsp % 16 == 8`, and the compiler emits `movaps` on that assumption. The
+forged frame handed the task a cleanly aligned `rsp`, every SSE spill was off by
+eight, and a misaligned `movaps` surfaces as `#GP` with nothing in it that
+mentions alignment.
+
+The fix is one subtraction. Finding it was a day.
 
 ---
 
@@ -450,6 +524,7 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   ai.rs          the serial protocol for talking to a model
   memory.rs      physical frames and the page tables
   heap.rs        the allocator behind Vec, String and Box
+  task.rs        stacks, the round-robin scheduler, the assembly switch
 bridge/          runs on your machine: serial <-> Claude API
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
@@ -470,7 +545,9 @@ because reading it is the point.
 - **The mode switch is borrowed.** Real mode → protected → long mode is done by
   the `bootloader` crate, not by us. That is the most interesting part of boot,
   and writing our own stage is on the list.
-- **Single core, no scheduler.** One thread of execution, forever.
+- **Single core.** The scheduler is round-robin across one CPU. Bringing up
+  the other cores means the APIC and an SMP trampoline, which is its own
+  project.
 - **The AI bridge needs a host process.** The kernel cannot reach a network by
   itself yet, so `ask` talks to `bridge/bridge.py` over a serial port rather
   than to the API directly. Removing that dependency means writing a virtio-net
