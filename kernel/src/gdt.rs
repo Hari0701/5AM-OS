@@ -18,6 +18,12 @@ pub const KERNEL_CODE: u16 = 1 << 3; // entry 1, ring 0
 pub const KERNEL_DATA: u16 = 2 << 3; // entry 2, ring 0
 pub const TSS_SELECTOR: u16 = 3 << 3; // entry 3-4 (a TSS descriptor is 16 bytes)
 
+/// Ring 3 selectors. The low two bits are the *requested* privilege level, and
+/// they are not decoration — load a selector with RPL 0 while in user mode and
+/// the CPU refuses. `| 3` is what makes these user selectors.
+pub const USER_DATA: u16 = (5 << 3) | 3; // entry 5, ring 3
+pub const USER_CODE: u16 = (6 << 3) | 3; // entry 6, ring 3
+
 /// Interrupt Stack Table slot we reserve for double faults.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -43,8 +49,14 @@ static mut DOUBLE_FAULT_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 #[derive(Clone, Copy)]
 struct Tss {
     reserved_1: u32,
-    /// Stacks to switch to when entering rings 0-2. Needed once we have
-    /// userspace; zero for now.
+    /// Stacks to switch to when entering rings 0-2.
+    ///
+    /// Slot 0 is the one that matters: when ring 3 code takes an interrupt or
+    /// makes a syscall, the CPU loads RSP from here *before* pushing anything.
+    /// It has to — the user's stack pointer cannot be trusted, and a kernel that
+    /// pushed a trap frame onto a user-controlled address would be handing the
+    /// machine away. Leave it zero and the first syscall from ring 3 triple
+    /// faults trying to push onto address 0.
     privilege_stack_table: [u64; 3],
     reserved_2: u64,
     /// Seven known-good stacks an interrupt can be forced onto.
@@ -71,8 +83,11 @@ impl Tss {
 
 static mut TSS: Tss = Tss::new();
 
-/// The table itself: null, code, data, and a 16-byte TSS descriptor.
-static mut GDT: [u64; 5] = [0; 5];
+/// A kernel stack for privilege transitions -- see `privilege_stack_table`.
+static mut SYSCALL_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+
+/// The table: null, kernel code/data, a 16-byte TSS descriptor, user data/code.
+static mut GDT: [u64; 7] = [0; 7];
 
 /// What `lgdt` actually consumes: a limit and a base address.
 #[repr(C, packed)]
@@ -126,9 +141,20 @@ pub unsafe fn init() {
         gdt[3] = low;
         gdt[4] = tss_addr >> 32; // base 32:63
 
+        // [5] User data and [6] user code. Identical to the kernel pair except
+        //     for bits 45-46, the Descriptor Privilege Level. DPL 3 is the
+        //     entire difference between code the CPU trusts and code it does
+        //     not -- there is no other flag, no other table, no other check.
+        gdt[5] = (1 << 44) | (1 << 47) | (1 << 41) | (3 << 45);
+        gdt[6] = (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53) | (3 << 45);
+
+        // The stack the CPU switches to on any entry from ring 3.
+        let syscall_start = core::ptr::addr_of!(SYSCALL_STACK) as u64;
+        tss.privilege_stack_table[0] = (syscall_start + STACK_SIZE as u64) & !0xF;
+
         // Tell the CPU where the table is.
         let pointer = DescriptorTablePointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: core::ptr::addr_of!(GDT) as u64,
         };
         asm!("lgdt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
@@ -172,6 +198,6 @@ pub fn current() -> (u64, u16) {
 }
 
 /// The raw entries, so the shell can decode them in front of you.
-pub fn entries() -> [u64; 5] {
+pub fn entries() -> [u64; 7] {
     unsafe { *core::ptr::addr_of!(GDT) }
 }
