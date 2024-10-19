@@ -146,6 +146,8 @@ pub unsafe fn init(regions: &MemoryRegions, physical_offset: u64) {
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
+/// Ring 3 may touch this page. Cleared, the page is kernel-only.
+const USER: u64 = 1 << 2;
 /// Bits 12..51 of an entry are the physical address of the next table.
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -177,12 +179,25 @@ pub unsafe fn map_page(virtual_address: u64, frame: u64, flags: u64) -> Result<(
     let indexes = indexes(virtual_address);
     let mut table = read_cr3();
 
+    // The user bit is checked at *every* level, and the CPU takes the strictest
+    // answer it finds. Setting it only on the final entry is the classic way to
+    // spend an afternoon: the page says ring 3 may read it, some table above it
+    // says otherwise, and the access faults with everything apparently correct.
+    // So it has to travel down the walk with us.
+    let user = flags & USER;
+
     // Walk levels 4, 3 and 2, creating tables where the path does not exist.
     for level in 0..3 {
         let entry_ptr = (physical_to_virtual(table) as *mut u64).add(indexes[level]);
         let entry = unsafe { *entry_ptr };
 
         table = if entry & PRESENT != 0 {
+            // An existing table on the path may have been built for the kernel.
+            // Widening it is safe -- the leaf entry still decides -- and it is
+            // the only way to hang a user page under a kernel branch.
+            if user != 0 && entry & USER == 0 {
+                unsafe { *entry_ptr = entry | USER };
+            }
             entry & ADDRESS_MASK
         } else {
             let new = allocator().allocate().ok_or("out of physical memory")?;
@@ -190,7 +205,7 @@ pub unsafe fn map_page(virtual_address: u64, frame: u64, flags: u64) -> Result<(
             // entries pointing at arbitrary physical addresses.
             unsafe {
                 core::ptr::write_bytes(physical_to_virtual(new) as *mut u8, 0, PAGE_SIZE);
-                *entry_ptr = new | PRESENT | WRITABLE;
+                *entry_ptr = new | PRESENT | WRITABLE | user;
             }
             new
         };
@@ -242,3 +257,67 @@ pub fn translate(virtual_address: u64) -> Option<(u64, [u64; 4])> {
 }
 
 pub const FLAG_WRITABLE: u64 = WRITABLE;
+pub const FLAG_USER: u64 = USER;
+
+/// Change the permissions on a page that is already mapped, keeping its frame.
+///
+/// This is how a loader seals what it has just written: map a page writable,
+/// copy code into it, then take the write permission away. After that even the
+/// kernel cannot modify it -- CR0.WP means ring 0 obeys the read-only bit too,
+/// which is precisely why that bit gets set.
+///
+/// # Safety
+/// Editing a live mapping. Removing a permission something still relies on
+/// surfaces as a fault at a completely unrelated instruction.
+pub unsafe fn set_flags(virtual_address: u64, flags: u64) -> Result<(), &'static str> {
+    let indexes = indexes(virtual_address);
+    let mut table = read_cr3();
+
+    for level in 0..3 {
+        let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(indexes[level]) };
+        if entry & PRESENT == 0 {
+            return Err("not mapped");
+        }
+        table = entry & ADDRESS_MASK;
+    }
+
+    let entry_ptr = (physical_to_virtual(table) as *mut u64).add(indexes[3]);
+    let entry = unsafe { *entry_ptr };
+    if entry & PRESENT == 0 {
+        return Err("not mapped");
+    }
+    unsafe {
+        *entry_ptr = (entry & ADDRESS_MASK) | flags | PRESENT;
+        asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
+    }
+    Ok(())
+}
+
+/// Is this address one ring 3 is allowed to touch?
+///
+/// The kernel asks this about every pointer a syscall hands it. A user program
+/// that passes a kernel address is not necessarily malicious -- it is more often
+/// simply wrong -- but a kernel that dereferences it either way has no isolation
+/// at all, only the appearance of some.
+pub fn is_user_accessible(address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len) else {
+        return false;
+    };
+    let mut page = address & !(PAGE_SIZE as u64 - 1);
+    while page < end {
+        let indexes = indexes(page);
+        let mut table = read_cr3();
+        for level in 0..4 {
+            let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(indexes[level]) };
+            if entry & PRESENT == 0 || entry & USER == 0 {
+                return false;
+            }
+            if level < 3 && entry & (1 << 7) != 0 {
+                break;
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        page += PAGE_SIZE as u64;
+    }
+    true
+}
