@@ -28,6 +28,7 @@ mod narrate;
 mod oracle;
 mod serial;
 mod shell;
+mod syscall;
 mod task;
 
 use bootloader_api::BootInfo;

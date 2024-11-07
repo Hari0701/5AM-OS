@@ -56,6 +56,20 @@ impl Entry {
         // before it has saved anything.
         self.options = 0x8E00 | ist;
     }
+
+    /// Point this vector at `handler` and let ring 3 raise it deliberately.
+    ///
+    /// The DPL in an IDT entry answers a different question from the DPL in a
+    /// GDT entry: not "who may run this code" but "who may reach it with an
+    /// `int` instruction". Leave it at 0 and hardware can still deliver the
+    /// vector, but a user program executing `int 0x80` gets a general
+    /// protection fault -- which is exactly what you want for every vector
+    /// except the one that is meant to be a front door.
+    fn set_user_callable(&mut self, handler: u64) {
+        self.set(handler, 0);
+        // 0xEE00 = present, DPL 3, 64-bit interrupt gate.
+        self.options = 0xEE00;
+    }
 }
 
 /// What the CPU pushes before entering a handler. Layout is fixed by hardware.
@@ -123,6 +137,10 @@ pub unsafe fn init() {
         idt[TIMER_VECTOR as usize].set(crate::task::timer_entry as *const () as u64, 0);
         idt[KEYBOARD_VECTOR as usize].set(keyboard_irq as *const () as u64, 0);
         idt[SERIAL_VECTOR as usize].set(serial_irq as *const () as u64, 0);
+
+        // The syscall gate: the single vector ring 3 is permitted to raise.
+        idt[crate::syscall::SYSCALL_VECTOR as usize]
+            .set_user_callable(crate::syscall::syscall_entry as *const () as u64);
 
         let pointer = DescriptorTablePointer {
             limit: (size_of::<[Entry; 256]>() - 1) as u16,
