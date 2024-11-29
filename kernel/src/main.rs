@@ -30,6 +30,7 @@ mod serial;
 mod shell;
 mod syscall;
 mod task;
+mod user;
 
 use bootloader_api::BootInfo;
 use core::panic::PanicInfo;

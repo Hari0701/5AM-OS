@@ -112,6 +112,7 @@ fn execute(command: &str) {
         "heap" => heap_status(),
         "tasks" => crate::task::report(),
         "spawn" => spawn(rest),
+        "user" => user_mode(),
         "translate" => translate(rest),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
@@ -157,6 +158,8 @@ fn help() {
     println!("  tasks             what is running, and how often it switched");
     println!("  spawn <prompt>    run the transformer in the background and");
     println!("                    keep using the shell while it thinks");
+    println!("  user              drop to ring 3 and come back through a");
+    println!("                    syscall -- the privilege boundary, live");
     println!("  translate <addr>  walk the page tables for an address");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
@@ -312,6 +315,20 @@ fn regs() {
     println!("  RFLAGS {rflags:#018x}   IF={}", (rflags >> 9) & 1);
     println!("         IF is the interrupt flag. It is 1, which is why the");
     println!("         keyboard you just typed on works.");
+}
+
+/// Run the ring 3 demonstration.
+///
+/// Kept behind a command rather than run at boot because it is the one thing
+/// here you want to watch deliberately.
+fn user_mode() {
+    println!();
+    println!("  Everything this kernel has done so far ran in ring 0: full");
+    println!("  privileges, kernel address space, no supervision. What follows");
+    println!("  does not.");
+    println!();
+    crate::user::run();
+    println!();
 }
 
 fn dump_gdt() {
