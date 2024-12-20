@@ -119,6 +119,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Transformer (15M) | working | Real inference in ring 0, nothing linked in |
 | AI bridge (COM2) | optional | Serial is the kernel's only reach into the outside world |
 | Preemptive multitasking | working | A task is register values plus a stack, nothing more |
+| Ring 3 + syscalls | working | Privilege is one field in a descriptor, enforced by hardware |
 
 ### Shell commands
 
@@ -343,6 +344,86 @@ The fix is one subtraction. Finding it was a day.
 
 ---
 
+## Leaving ring 0
+
+Everything above this point runs at the highest privilege the CPU has. `explain
+rings` has been describing ring 3 since the first week of this project, entirely
+from the outside. `user` goes there.
+
+```
+5am> user
+  Mapping two pages that ring 3 is allowed to touch:
+    code  0x200000  user, read-execute
+    stack 0x210000  user, read-write
+    code page sealed read-only, with the program already in it
+
+  Dropping to ring 3. Nothing below this line is privileged.
+
+  hello from ring 3 -- printed by a syscall
+
+  [syscall] the caller reports cs = 0x33
+            low two bits = 3, so it is running in ring 3
+            the kernel's own cs is 0x8, ring 0
+  [syscall] write(0x100000000000, 16) REFUSED
+            that address is not user-accessible.
+  [syscall] exit(0) -- leaving ring 3
+
+  Back in ring 0, by way of 4 syscalls.
+```
+
+### What ring 3 actually costs the code running in it
+
+Surprisingly little. Same instructions, same registers, same address space.
+Three things change:
+
+- `cli`, `hlt`, `in`, `out`, `lgdt`, writes to CR3 — anything that touches the
+  machine rather than the program — raise `#GP` instead of working.
+- Pages without the user bit are unreachable, even to read.
+- There is exactly one way to ask for anything: an interrupt.
+
+That last one is the design. A user program *cannot call* the kernel, because
+calling means jumping to an address and the kernel's addresses are not reachable
+from ring 3. It can only raise an interrupt and let the CPU decide where that
+lands — and the CPU decides from the IDT, which the kernel owns. The kernel
+picks its own entry points. The boundary is hardware, not agreement.
+
+### There is no instruction for "lower your privilege"
+
+The only way down is to return from an interrupt that never happened: build a
+trap frame claiming we came from ring 3, and `iretq` into the lie. The CPU
+checks the RPL of the CS being restored, sees 3, and obliges.
+
+And the only way back up is the exit syscall. That is not a design choice so
+much as a consequence — nothing in ring 3 can name a kernel address to jump to.
+
+### The check that makes this a kernel
+
+`write` takes a pointer chosen by code we do not trust. If it names a kernel
+page, dereferencing it leaks kernel memory to ring 3 through a completely
+legitimate-looking interface: the program never left its sandbox, it just asked
+the kernel to reach out of one. So every syscall pointer is walked through the
+page tables first, and the user bit checked at every level.
+
+Most programs that trip this are not attacking anything. They just have a stale
+pointer. A kernel that trusts them either way has no isolation, only the
+appearance of some.
+
+### What this cost
+
+Two faults, both mine, both instructive.
+
+The code page was mapped read-only from the start — and the kernel's own copy
+*into* it faulted. `CR0.WP` means ring 0 is subject to the read-only bit too,
+which is the entire reason that bit is worth setting. The fix is what a real
+loader does: map writable, copy, then seal.
+
+Then the program faulted at `0x2c` reading a null-ish address. `mov rsi, label`
+in Intel syntax is a load *from* that address, not the constant — and `0x2c`
+was the message length. The fault pointed at the first page; the bug was an
+addressing mode.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -525,6 +606,8 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   memory.rs      physical frames and the page tables
   heap.rs        the allocator behind Vec, String and Box
   task.rs        stacks, the round-robin scheduler, the assembly switch
+  syscall.rs     ring 3, int 0x80, and the only door back in
+  user.rs        the first program here that is not the kernel
 bridge/          runs on your machine: serial <-> Claude API
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
@@ -542,6 +625,16 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
+- **No ELF loader.** The ring 3 program is assembled into the kernel and
+  copied into a user page, so it can only reference things inside itself. Real
+  programs come from a filesystem and get relocated by a loader; this kernel
+  has neither yet.
+- **Userspace is not preemptible.** Ring 3 runs with interrupts disabled,
+  because the timer entry does not yet understand a privilege change. One
+  program at a time, and it must exit by syscall.
+- **One address space.** Ring 3 is fenced off by the user bit, not by a
+  separate page table. Every task still shares one CR3, so "process" does not
+  mean what it means elsewhere.
 - **The mode switch is borrowed.** Real mode → protected → long mode is done by
   the `bootloader` crate, not by us. That is the most interesting part of boot,
   and writing our own stage is on the list.
