@@ -1,0 +1,23 @@
+# A program, not a kernel.
+#
+# Deliberately outside the root workspace. It is not built for this machine and
+# it is not built for the kernel's custom target -- it is built for ring 3, and
+# the kernel's build.rs invokes this separately. Making it a workspace member
+# would mean `cargo build` at the root tried to compile a freestanding user
+# program for macOS.
+[workspace]
+
+[package]
+name = "userland"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+# Smaller is better here: every byte gets copied into a user page by hand.
+opt-level = "s"
+debug = false

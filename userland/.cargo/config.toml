@@ -1,0 +1,12 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # No PIE and no GOT: the loader in this kernel does not relocate anything,
+    # so every address in the binary has to be final at link time.
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tlink.ld",
+    # Force page-sized segment alignment so no two PT_LOADs share a page.
+    "-C", "link-arg=-z", "-C", "link-arg=max-page-size=4096",
+]

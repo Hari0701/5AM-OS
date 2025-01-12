@@ -1,5 +1,6 @@
 # Rust
-/target
+# Any target dir, not just the root one: userland/ is its own build.
+target/
 **/*.rs.bk
 
 # Disk images are build artifacts
