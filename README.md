@@ -120,6 +120,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | AI bridge (COM2) | optional | Serial is the kernel's only reach into the outside world |
 | Preemptive multitasking | working | A task is register values plus a stack, nothing more |
 | Ring 3 + syscalls | working | Privilege is one field in a descriptor, enforced by hardware |
+| ELF loader | working | Segments are for the loader; sections are for the linker |
 
 ### Shell commands
 
@@ -424,6 +425,52 @@ addressing mode.
 
 ---
 
+### Loading a program it did not compile
+
+`userland/` is a separate crate. It is compiled on its own, linked on its own,
+and cannot see a kernel symbol — the only things the two share are the number in
+`int 0x80` and which registers carry what. That is an ABI, and it is the
+smallest honest example of one I could build.
+
+What arrives at the kernel is an ELF file, and the kernel has to read it:
+
+```
+5am> user
+  The program is a 13016 byte ELF file, built separately.
+  Reading its program headers:
+    entry point 0x400000, 4 program headers
+    0x00400000     155 bytes  r-x
+    0x00401000     239 bytes  r--
+    0x00402000    8192 bytes  rw- (.bss: more memory than file)
+  3 segments loaded, 16384 bytes of fresh zeroed memory.
+  stack     0x00100000  16384 bytes, rw-, mapped by the kernel
+
+  Jumping to 0x400000 in ring 3.
+```
+
+**An ELF file has two separate tables of contents, and the surprise is which one
+matters.** Sections — `.text`, `.rodata`, `.bss` — are for the linker, and a
+loader may ignore them completely; a stripped binary has none and still runs.
+Segments, described by program headers, are for the loader, and they are all
+`elf.rs` reads. Walk the headers; for each `PT_LOAD`, put those bytes at that
+address with those permissions. That is the entire algorithm. The rest of the
+file is checking, and the checking is the point: every failure is a refusal to
+run something, because a loader that guesses is a loader that executes bytes
+somebody else chose.
+
+**`memsz > filesz` is where a loader earns its name.** A segment may ask for more
+memory than the file contains. The difference is `.bss` — variables that start at
+zero, which would be absurd to store on disk as actual zeroes. The loader owes
+the program that memory, zeroed, and "zeroed" is not politeness: those frames
+held something before, and handing them over uncleared leaks it into a program
+that should not see it, while appearing to work perfectly. The program checks
+all 8192 bytes at startup and says so.
+
+The stack is mapped by the kernel, because no program header asks for one. Every
+process on every operating system gets a stack it never requested.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -607,8 +654,10 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   heap.rs        the allocator behind Vec, String and Box
   task.rs        stacks, the round-robin scheduler, the assembly switch
   syscall.rs     ring 3, int 0x80, and the only door back in
-  user.rs        the first program here that is not the kernel
+  elf.rs         reads program headers and loads what they describe
+  user.rs        maps a stack and starts the loaded program
 bridge/          runs on your machine: serial <-> Claude API
+userland/        a program, not a kernel. built separately, loaded as ELF
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
 ```
@@ -625,10 +674,14 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
-- **No ELF loader.** The ring 3 program is assembled into the kernel and
-  copied into a user page, so it can only reference things inside itself. Real
-  programs come from a filesystem and get relocated by a loader; this kernel
-  has neither yet.
+- **Programs are embedded, not opened.** The loader takes a byte slice and does
+  not care where it came from, but there is no filesystem to read one from, so
+  the ELF is baked into the kernel image at build time.
+- **No relocation.** Only `ET_EXEC` at a fixed address. Position-independent
+  executables are refused rather than half-supported, because running one means
+  choosing a base and applying relocations.
+- **No NX.** `EFER.NXE` is never set, so every mapped page is executable. A
+  segment marked `rw-` is a lie the loader currently tells.
 - **Userspace is not preemptible.** Ring 3 runs with interrupts disabled,
   because the timer entry does not yet understand a privilege change. One
   program at a time, and it must exit by syscall.
