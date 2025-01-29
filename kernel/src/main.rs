@@ -15,6 +15,7 @@
 mod ai;
 extern crate alloc;
 
+mod elf;
 mod font;
 mod fpu;
 mod framebuffer;
