@@ -9,7 +9,7 @@
 # macOS and fail in confusing ways.
 [workspace]
 resolver = "2"
-members = ["kernel", "boot"]
+members = ["kernel", "boot", "mkfs"]
 
 [profile.release]
 # A panic in a kernel has nowhere to unwind to — there is no runtime to catch it.

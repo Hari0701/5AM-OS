@@ -1,0 +1,11 @@
+5AM-OS
+
+Started as an empty repository in February 2023, on the theory that the
+only way to find out how an operating system works is to be forced to
+decide what it does next.
+
+Read the source in the order it was written and it is roughly a course:
+serial, descriptor tables, interrupts, a keyboard, memory, a heap, a
+scheduler, a privilege boundary, a loader, and now a disk.
+
+Nothing here is linked in from a crate you have not read.
