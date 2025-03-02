@@ -113,6 +113,9 @@ fn execute(command: &str) {
         "tasks" => crate::task::report(),
         "spawn" => spawn(rest),
         "user" => user_mode(),
+        "ls" => list_files(),
+        "cat" => cat(rest),
+        "exec" => exec(rest),
         "translate" => translate(rest),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
@@ -160,6 +163,9 @@ fn help() {
     println!("                    keep using the shell while it thinks");
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
+    println!("  ls                list the files on the FAT16 disk");
+    println!("  cat <file>        print a file from that disk");
+    println!("  exec <file>       load an ELF off the disk and run it in ring 3");
     println!("  translate <addr>  walk the page tables for an address");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
@@ -315,6 +321,102 @@ fn regs() {
     println!("  RFLAGS {rflags:#018x}   IF={}", (rflags >> 9) & 1);
     println!("         IF is the interrupt flag. It is 1, which is why the");
     println!("         keyboard you just typed on works.");
+}
+
+/// Everything the disk commands need: a mounted volume, or a reason why not.
+fn volume() -> Option<crate::fat::Volume> {
+    match crate::fat::mount() {
+        Ok(volume) => Some(volume),
+        Err(error) => {
+            println!("  cannot read the disk: {error}");
+            None
+        }
+    }
+}
+
+fn list_files() {
+    let Some(volume) = volume() else { return };
+    let entries = match volume.list() {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!("  cannot read the root directory: {error}");
+            return;
+        }
+    };
+
+    if entries.is_empty() {
+        println!("  the disk is empty");
+        return;
+    }
+
+    println!(
+        "  FAT16, {} clusters of {} bytes",
+        volume.clusters,
+        volume.sectors_per_cluster * volume.bytes_per_sector
+    );
+    println!("  {:<14}{:>9}  {}", "name", "size", "first cluster");
+    for entry in &entries {
+        println!("  {:<14}{:>9}  {}", entry.name, entry.size, entry.first_cluster);
+    }
+}
+
+fn cat(name: &str) {
+    if name.is_empty() {
+        println!("  usage: cat <file>");
+        return;
+    }
+    let Some(volume) = volume() else { return };
+    let entry = match volume.find(name) {
+        Ok(entry) => entry,
+        Err(error) => {
+            println!("  {name}: {error}");
+            return;
+        }
+    };
+    let data = match volume.read_file(&entry) {
+        Ok(data) => data,
+        Err(error) => {
+            println!("  {name}: {error}");
+            return;
+        }
+    };
+
+    match core::str::from_utf8(&data) {
+        Ok(text) => print!("{text}"),
+        Err(_) => println!("  {name} is not text ({} bytes)", data.len()),
+    }
+}
+
+/// Load an ELF off the disk and run it.
+///
+/// This is the command the last three subsystems were building towards. The
+/// kernel has never seen this file, was not compiled against it, and learns its
+/// entry point by reading it.
+fn exec(name: &str) {
+    if name.is_empty() {
+        println!("  usage: exec <file>");
+        return;
+    }
+    let Some(volume) = volume() else { return };
+    let entry = match volume.find(name) {
+        Ok(entry) => entry,
+        Err(error) => {
+            println!("  {name}: {error}");
+            return;
+        }
+    };
+    let data = match volume.read_file(&entry) {
+        Ok(data) => data,
+        Err(error) => {
+            println!("  {name}: {error}");
+            return;
+        }
+    };
+
+    println!();
+    println!("  Read {} bytes of {name} off the disk.", data.len());
+    crate::user::run_bytes(&data);
+    println!();
 }
 
 /// Run the ring 3 demonstration.

@@ -13,9 +13,11 @@
 #![feature(abi_x86_interrupt)] // Lets us write interrupt handlers as plain fns.
 
 mod ai;
+mod ata;
 extern crate alloc;
 
 mod elf;
+mod fat;
 mod font;
 mod fpu;
 mod framebuffer;

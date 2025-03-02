@@ -28,6 +28,21 @@ cargo build --package boot --release
 KERNEL="target/x86_64-5am_os/release/kernel"
 IMAGE="$(./target/release/boot "$KERNEL")"
 
+# 3. The filesystem, on a second disk.
+#
+# The ring 3 program is built here as well as by the kernel's build.rs. That is
+# not redundant: build.rs bakes a copy into the kernel image so `user` works
+# with no disk at all, and this copy is a FILE, which is the entire point of
+# `exec hello.elf`.
+(cd userland && cargo build --release)
+cargo build --package mkfs --release
+
+FS="target/fs.img"
+./target/release/mkfs "$FS" \
+  hello.elf=userland/target/x86_64-unknown-none/release/hello \
+  readme.txt=disk/readme.txt \
+  motd.txt=disk/motd.txt
+
 echo "==> booting $IMAGE"
 echo "==> quit with Ctrl-A then X"
 echo
@@ -49,8 +64,11 @@ fi
 # COM2 is a TCP server that does not wait for a connection: with no bridge
 # running the kernel simply times out on `ask`, and everything else is
 # unaffected.
+# Two disks on the IDE primary bus. Order matters: index=0 is the master, which
+# the BIOS boots from, and index=1 is the slave, which ata.rs reads.
 exec qemu-system-x86_64 \
-  -drive format=raw,file="$IMAGE" \
+  -drive format=raw,file="$IMAGE",if=ide,index=0 \
+  -drive format=raw,file="$FS",if=ide,index=1 \
   -serial stdio \
   -serial "tcp:127.0.0.1:${BRIDGE_PORT:-4444},server=on,wait=off" \
   -cpu max \

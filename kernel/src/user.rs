@@ -27,11 +27,20 @@ static PROGRAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
 const USER_STACK_ADDRESS: u64 = 0x10_0000;
 const USER_STACK_PAGES: u64 = 4;
 
+/// Run the copy of the program that was built into the kernel image.
 pub fn run() {
     println!("  The program is a {} byte ELF file, built separately.", PROGRAM.len());
+    run_bytes(PROGRAM);
+}
+
+/// Run an ELF from anywhere -- the kernel image, or a disk.
+///
+/// `load()` takes a byte slice and does not care where it came from, which is
+/// the whole reason `exec` needed nothing new from this module.
+pub fn run_bytes(program: &[u8]) {
     println!("  Reading its program headers:");
 
-    let loaded = match unsafe { elf::load(PROGRAM, true) } {
+    let loaded = match unsafe { elf::load(program, true) } {
         Ok(loaded) => loaded,
         Err(error) => {
             println!("  refusing to run it: {error}");
