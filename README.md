@@ -121,6 +121,8 @@ ARM Mac is emulating x86 instruction by instruction.
 | Preemptive multitasking | working | A task is register values plus a stack, nothing more |
 | Ring 3 + syscalls | working | Privilege is one field in a descriptor, enforced by hardware |
 | ELF loader | working | Segments are for the loader; sections are for the linker |
+| ATA PIO disk | working | The CPU personally carries every byte |
+| FAT16 (read-only) | working | A file is a linked list living in a table |
 
 ### Shell commands
 
@@ -471,6 +473,81 @@ process on every operating system gets a stack it never requested.
 
 ---
 
+## A disk
+
+Everything above this point was compiled into the kernel. The shell, the neural
+network weights, even the ring 3 program — one image, decided at build time.
+`include_bytes!` is not a filesystem; it is a promise made by the compiler.
+
+```
+5am> ls
+  FAT16, 8167 clusters of 2048 bytes
+  name               size  first cluster
+  HELLO.ELF         13016  2
+  README.TXT          997  9
+  MOTD.TXT            436  10
+
+5am> exec hello.elf
+  Read 13016 bytes of hello.elf off the disk.
+  Reading its program headers:
+    entry point 0x400000, 4 program headers
+    0x00400000     155 bytes  r-x
+    0x00401000     239 bytes  r--
+    0x00402000    8192 bytes  rw- (.bss: more memory than file)
+
+  Jumping to 0x400000 in ring 3.
+
+  hello from ring 3 -- a real ELF, loaded from its program headers
+```
+
+The kernel found that file by reading sector 0 of a disk it had never seen,
+believing what the BIOS Parameter Block said about where things live, walking
+the root directory, and following a chain of cluster numbers.
+
+### Why FAT, when something simpler would have been nicer to write
+
+Because it can be checked. The image `mkfs` produces mounts on macOS:
+
+```bash
+hdiutil attach target/fs.img
+```
+
+Finder opens it, the files are there, and `HELLO.ELF` is byte-identical to what
+the linker produced. If macOS and 5AM-OS both understand the volume, they
+understand the same specification. A format of my own invention would have been
+half the code and only ever verifiable against the thing under test.
+
+### A file is a linked list
+
+One array — the File Allocation Table — with one entry per cluster, each holding
+the number of the *next* cluster in the same file. The list lives in a table at
+the front of the disk rather than in the data.
+
+Everything good and bad about FAT follows from that. Appending is trivial.
+Seeking to byte 40,000 means walking from the beginning, because nothing indexes
+it. And if the table is damaged the data is all still there, in an order nothing
+records.
+
+Two details worth not reading past. The "16" is the width of a table entry, and
+**nothing on the volume says which variant it is** — a reader computes the
+cluster count and takes the answer, which is why resizing a volume can silently
+turn it into a different filesystem. And entries 0 and 1 describe no cluster at
+all, which is why every cluster-to-sector calculation ever written subtracts two.
+
+### The disk driver is the oldest one that still works
+
+No DMA, no interrupts, no queueing. Ask for a sector, spin on a status port
+until the drive says it has data, then pull 256 words through a single 16-bit
+port. The CPU personally carries every byte — that is what "programmed I/O"
+means, and why nothing has shipped it as a fast path in thirty years.
+
+The data port is sixteen bits wide, so reading it a byte at a time returns the
+low half twice. And the wait loop is bounded on purpose: a missing drive floats
+the bus high, `BSY` never clears, and an honest `loop` there hangs the machine
+at boot with nothing printed.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -655,9 +732,13 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   task.rs        stacks, the round-robin scheduler, the assembly switch
   syscall.rs     ring 3, int 0x80, and the only door back in
   elf.rs         reads program headers and loads what they describe
+  ata.rs         IDE disk reads, one sector at a time, through the CPU
+  fat.rs         FAT16, read-only: root directory and cluster chains
   user.rs        maps a stack and starts the loaded program
 bridge/          runs on your machine: serial <-> Claude API
 userland/        a program, not a kernel. built separately, loaded as ELF
+mkfs/            runs on your machine: writes the FAT16 disk image
+disk/            text files that end up on that disk
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
 ```
@@ -674,9 +755,11 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
-- **Programs are embedded, not opened.** The loader takes a byte slice and does
-  not care where it came from, but there is no filesystem to read one from, so
-  the ELF is baked into the kernel image at build time.
+- **The filesystem is read-only.** Nothing writes to the disk. Writing means
+  allocating clusters and updating both copies of the table without leaving the
+  volume inconsistent if the power goes out halfway, which is most of what a
+  real filesystem is.
+- **Root directory only.** No subdirectories, no long file names, 8.3 only.
 - **No relocation.** Only `ET_EXEC` at a fixed address. Position-independent
   executables are refused rather than half-supported, because running one means
   choosing a base and applying relocations.
