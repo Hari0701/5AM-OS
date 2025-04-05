@@ -257,10 +257,41 @@ pub unsafe fn drain_console() {
     }
 }
 
+/// Serialises whole `print!` calls against each other.
+///
+/// Without this the output of two tasks interleaves *mid-word*: the timer can
+/// take the CPU away between any two characters, and a formatted print is many
+/// writes to a port. The first version of the scheduler demo produced
+/// `once upon a timetasks` and I described it as proof of preemption, which it
+/// was -- and also a data race with a benign-looking symptom.
+///
+/// The lock covers the format-and-emit of one macro invocation, which is the
+/// unit a reader expects to arrive whole. It does not make interleaving
+/// impossible between two prints; nothing could, short of a line discipline.
+static CONSOLE_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+/// Let the fault handlers print no matter who was holding the lock.
+///
+/// A kernel that has decided to stop has exactly one remaining duty. If the
+/// code that faulted was halfway through a print, blocking here would replace
+/// the explanation with silence.
+///
+/// # Safety
+/// Abandons mutual exclusion. Only for a path that never returns.
+pub unsafe fn force_unlock_console() {
+    unsafe { CONSOLE_LOCK.force_unlock() };
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    // SAFETY: single-threaded, interrupts still disabled. See CONSOLE above.
+
+    // Held for the whole emit, and dropped before returning -- the guard also
+    // restores the interrupt flag, so a print inside a critical section does
+    // not quietly re-enable interrupts on the way out.
+    let _guard = CONSOLE_LOCK.lock();
+
+    // SAFETY: the lock above is what makes this exclusive.
     unsafe {
         let console = &mut *core::ptr::addr_of_mut!(CONSOLE);
         let _ = console.write_fmt(args);
