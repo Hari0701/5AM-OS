@@ -31,6 +31,7 @@ mod narrate;
 mod oracle;
 mod serial;
 mod shell;
+mod sync;
 mod syscall;
 mod task;
 mod user;

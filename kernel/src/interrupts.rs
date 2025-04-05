@@ -194,6 +194,18 @@ pub fn enable() {
     unsafe { asm!("sti", options(nomem, nostack)) };
 }
 
+/// Is the interrupt flag currently set?
+///
+/// Read from RFLAGS rather than tracked in a variable, because the CPU changes
+/// it behind our back: entering an interrupt gate clears it, `iretq` restores
+/// it. Anything we recorded ourselves would be wrong the moment hardware
+/// disagreed.
+pub fn are_enabled() -> bool {
+    let flags: u64;
+    unsafe { asm!("pushfq; pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    flags & (1 << 9) != 0
+}
+
 pub fn disable() {
     unsafe { asm!("cli", options(nomem, nostack)) };
 }
@@ -206,9 +218,7 @@ pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let flags: u64;
-    unsafe { asm!("pushfq; pop {}", out(reg) flags, options(nomem, preserves_flags)) };
-    let was_enabled = flags & (1 << 9) != 0; // IF, the interrupt flag
+    let was_enabled = are_enabled();
 
     disable();
     let result = f();
@@ -226,6 +236,9 @@ where
 // makes it a keyword.
 
 extern "x86-interrupt" fn divide_by_zero(frame: InterruptStackFrame) {
+    // We are about to stop the machine. Take the console by force rather than
+    // waiting on a lock whose holder may be the code that just faulted.
+    unsafe { crate::serial::force_unlock_console() };
     println!("\n[trap] DIVIDE BY ZERO at {:#x}", frame.rip);
     println!("       The CPU cannot represent the result, so it asked us.");
     crate::halt_forever();
@@ -238,11 +251,17 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
+    // We are about to stop the machine. Take the console by force rather than
+    // waiting on a lock whose holder may be the code that just faulted.
+    unsafe { crate::serial::force_unlock_console() };
     println!("\n[trap] INVALID OPCODE at {:#x}", frame.rip);
     crate::halt_forever();
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error: u64) {
+    // We are about to stop the machine. Take the console by force rather than
+    // waiting on a lock whose holder may be the code that just faulted.
+    unsafe { crate::serial::force_unlock_console() };
     println!("\n[trap] GENERAL PROTECTION FAULT at {:#x}", frame.rip);
     println!("       error code {error:#x}");
     println!();
@@ -251,6 +270,9 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error: 
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
+    // We are about to stop the machine. Take the console by force rather than
+    // waiting on a lock whose holder may be the code that just faulted.
+    unsafe { crate::serial::force_unlock_console() };
     // CR2 holds the address that could not be translated.
     let address: u64;
     unsafe { asm!("mov {}, cr2", out(reg) address, options(nomem, nostack)) };
@@ -284,6 +306,9 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, _error: u64) -> ! {
+    // We are about to stop the machine. Take the console by force rather than
+    // waiting on a lock whose holder may be the code that just faulted.
+    unsafe { crate::serial::force_unlock_console() };
     // We are running on the IST stack right now. If we were not, this message
     // would never appear — the machine would have reset instead.
     println!("\n[trap] DOUBLE FAULT at {:#x}", frame.rip);
