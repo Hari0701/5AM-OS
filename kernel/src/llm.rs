@@ -76,6 +76,9 @@ struct RunState {
     value_cache: [f32; MAX_LAYERS * MAX_SEQ * MAX_DIM],
 }
 
+/// The one set of activations. Every access is gated by `GENERATING` above,
+/// which is what makes the `addr_of_mut!` reads below exclusive rather than
+/// merely unobserved.
 static mut STATE: RunState = RunState {
     x: [0.0; MAX_DIM],
     xb: [0.0; MAX_DIM],
@@ -601,7 +604,35 @@ fn argmax(values: &[f32]) -> usize {
 }
 
 /// Generate from a prompt, streaming each token as it is produced.
+/// Whoever is currently using STATE.
+///
+/// There is exactly one set of activations, key cache and value cache in this
+/// kernel -- several megabytes of statics, sized for the largest model it
+/// supports. Once tasks became preemptible, two `spawn`s would take turns
+/// writing into the same buffers and produce fluent nonsense, with nothing
+/// anywhere reporting a problem.
+///
+/// The cheap fix would be one generation at a time by convention. This makes it
+/// true.
+static GENERATING: crate::sync::Claim = crate::sync::Claim::new();
+
+/// Is a generation in progress? For the shell's `tasks` output.
+pub fn busy() -> bool {
+    GENERATING.is_taken()
+}
+
 pub fn generate(prompt: &str, steps: usize) {
+    // Held for the whole run and released on every exit path, including the
+    // early return just below.
+    let Some(_generating) = GENERATING.try_take() else {
+        println!();
+        println!("The model is already running somewhere else.");
+        println!("There is one set of activations in this kernel, so a second");
+        println!("generation would write into the first one's KV cache and both");
+        println!("would produce confident nonsense. Try again when it finishes.");
+        return;
+    };
+
     let Some(model) = model() else {
         println!("No model is loaded.");
         println!();

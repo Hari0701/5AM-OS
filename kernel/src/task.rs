@@ -282,6 +282,9 @@ pub unsafe extern "C" fn timer_entry() {
 pub fn report() {
     let tasks = tasks();
     let current = current_id();
+    if crate::llm::busy() {
+        println!("  the model is claimed by one task (only one may run it)");
+    }
     println!("  id  name      state     switches");
     for (id, task) in tasks.iter().enumerate() {
         let state = match task.state {
