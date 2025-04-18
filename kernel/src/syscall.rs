@@ -180,6 +180,14 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) {
         // Everything the SysV ABI says a callee must preserve. `exit` returns
         // by restoring RSP to here and popping them.
         "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
+        // And the flags -- above all the interrupt flag. The frame below hands
+        // ring 3 an RFLAGS with IF clear, and `exit` does not come back through
+        // an iretq that would restore ours. Without saving it here, the kernel
+        // resumes with interrupts off permanently: no timer, no scheduler, and
+        // a shell that never sees another keystroke because input arrives by
+        // IRQ. The program's output has already been printed by then, so the
+        // machine looks like it worked and is in fact deaf.
+        "pushfq",
         "mov [rip + {saved}], rsp",
 
         // Data segments have to be ring 3 too, or the first push in user mode
@@ -214,6 +222,8 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) {
 unsafe extern "C" fn return_to_kernel() -> ! {
     naked_asm!(
         "mov rsp, [rip + {saved}]",
+        // Interrupts come back on here, if they were on when we left.
+        "popfq",
         // Segment registers still hold ring 3 selectors; put the kernel's back.
         "mov ax, {kdata}",
         "mov ds, ax",
