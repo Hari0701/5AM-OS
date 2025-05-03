@@ -256,6 +256,66 @@ pub fn translate(virtual_address: u64) -> Option<(u64, [u64; 4])> {
     Some((table + (virtual_address & 0xFFF), entries))
 }
 
+/// Undo a mapping and hand back the frame it pointed at.
+///
+/// The counterpart `map_page` never had, which is why every `exec` used to cost
+/// the machine a few pages permanently. A kernel that can only map is a kernel
+/// with a memory leak measured in programs run.
+///
+/// Only the last-level entry is cleared. The tables above it are left in place
+/// even when they empty out -- reclaiming those means knowing whether any of
+/// their 512 entries is still live, and getting that wrong frees a table
+/// something else is still walking. Real kernels keep a count per table; this
+/// one keeps the four pages.
+///
+/// # Safety
+/// The address must not be in use. Nothing here checks whether a task is still
+/// standing on it.
+pub unsafe fn unmap_page(virtual_address: u64) -> Option<u64> {
+    let indexes = indexes(virtual_address);
+    let mut table = read_cr3();
+
+    for level in 0..3 {
+        let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(indexes[level]) };
+        if entry & PRESENT == 0 {
+            return None;
+        }
+        table = entry & ADDRESS_MASK;
+    }
+
+    let entry_ptr = (physical_to_virtual(table) as *mut u64).add(indexes[3]);
+    let entry = unsafe { *entry_ptr };
+    if entry & PRESENT == 0 {
+        return None;
+    }
+
+    unsafe {
+        *entry_ptr = 0;
+        // Without this the CPU keeps serving the old translation out of the
+        // TLB, and the page stays readable after it has been handed to someone
+        // else -- a bug that looks like memory corruption in an unrelated
+        // subsystem.
+        asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
+    }
+
+    Some(entry & ADDRESS_MASK)
+}
+
+/// Unmap a range and return every frame to the allocator.
+///
+/// # Safety
+/// As `unmap_page`, for every page in the range.
+pub unsafe fn release(pages: &[u64]) -> usize {
+    let mut freed = 0;
+    for &page in pages {
+        if let Some(frame) = unsafe { unmap_page(page) } {
+            unsafe { allocator().deallocate(frame) };
+            freed += 1;
+        }
+    }
+    freed
+}
+
 pub const FLAG_WRITABLE: u64 = WRITABLE;
 pub const FLAG_USER: u64 = USER;
 

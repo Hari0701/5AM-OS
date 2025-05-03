@@ -31,6 +31,7 @@
 //! supposed to see it, while looking like it worked.
 
 use crate::memory::{self, PAGE_SIZE};
+use alloc::vec::Vec;
 
 const MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const CLASS_64: u8 = 2;
@@ -48,6 +49,11 @@ pub struct Loaded {
     pub entry: u64,
     pub segments: usize,
     pub bytes_zeroed: u64,
+    /// Every page this load mapped, so the caller can give them back.
+    ///
+    /// Somebody has to remember. A loader that maps and forgets leaves the
+    /// frames unreachable and still allocated for as long as the machine runs.
+    pub pages: Vec<u64>,
 }
 
 /// One program header, exactly as it appears on disk.
@@ -139,6 +145,7 @@ pub unsafe fn load(data: &[u8], verbose: bool) -> Result<Loaded, &'static str> {
 
     let mut segments = 0;
     let mut bytes_zeroed = 0u64;
+    let mut pages = Vec::new();
 
     for index in 0..header_count {
         let at = header_offset + index * header_size;
@@ -216,6 +223,7 @@ pub unsafe fn load(data: &[u8], verbose: bool) -> Result<Loaded, &'static str> {
                     core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
                 }
                 bytes_zeroed += PAGE_SIZE as u64;
+                pages.push(page);
             }
             page += PAGE_SIZE as u64;
         }
@@ -278,6 +286,7 @@ pub unsafe fn load(data: &[u8], verbose: bool) -> Result<Loaded, &'static str> {
         entry,
         segments,
         bytes_zeroed,
+        pages,
     })
 }
 

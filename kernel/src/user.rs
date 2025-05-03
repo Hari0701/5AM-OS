@@ -40,7 +40,7 @@ pub fn run() {
 pub fn run_bytes(program: &[u8]) {
     println!("  Reading its program headers:");
 
-    let loaded = match unsafe { elf::load(program, true) } {
+    let mut loaded = match unsafe { elf::load(program, true) } {
         Ok(loaded) => loaded,
         Err(error) => {
             println!("  refusing to run it: {error}");
@@ -70,6 +70,7 @@ pub fn run_bytes(program: &[u8]) {
             return;
         }
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE) };
+        loaded.pages.push(address);
     }
 
     let stack_top = USER_STACK_ADDRESS + USER_STACK_PAGES * PAGE_SIZE as u64;
@@ -89,8 +90,15 @@ pub fn run_bytes(program: &[u8]) {
         syscall::enter_ring3(loaded.entry, stack_top - 8);
     }
 
+    // The program is over, so its address space is rubbish. Hand every frame
+    // back: without this, each `exec` costs the machine a few pages forever,
+    // and running one in a loop eventually exhausts physical memory with no
+    // sign of what took it.
+    let freed = unsafe { memory::release(&loaded.pages) };
+
     println!();
     println!("  Back in ring 0, by way of {} syscalls.", syscall::count() - before);
+    println!("  {freed} pages unmapped and returned to the frame allocator.");
     println!("  Nothing in that program was compiled with this kernel. The only");
     println!("  thing they share is the number in `int 0x80`.");
 }
