@@ -123,6 +123,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | ELF loader | working | Segments are for the loader; sections are for the linker |
 | ATA PIO disk | working | The CPU personally carries every byte |
 | FAT16 (read-only) | working | A file is a linked list living in a table |
+| Locks | working | A kernel lock exists to stop re-entrancy, not just parallelism |
 
 ### Shell commands
 
@@ -413,7 +414,22 @@ appearance of some.
 
 ### What this cost
 
-Two faults, both mine, both instructive.
+Three faults, all mine, all instructive.
+
+The one I am least proud of: `exit` restores a saved RSP and returns rather than
+going back through `iretq`, and nothing on that path restored the kernel's
+`RFLAGS`. Ring 3 runs with `IF` clear by design — so the kernel came back with
+**interrupts disabled permanently**. No timer, no scheduler, no keyboard IRQ.
+
+What makes it worth writing down is why it survived three rounds of testing: the
+program's output is already printed by the time it happens. The transcript looks
+perfect. The machine is simply deaf afterwards, and everything typed next goes
+into a buffer nothing will ever read. I checked the output, saw exactly what I
+expected, and moved on — three times. It surfaced only when a test happened to
+run `exec` twice and the second one never appeared.
+
+A passing transcript is not a passing test if you only wrote down what you were
+hoping to see.
 
 The code page was mapped read-only from the start — and the kernel's own copy
 *into* it faulted. `CR0.WP` means ring 0 is subject to the read-only bit too,
@@ -545,6 +561,45 @@ The data port is sixteen bits wide, so reading it a byte at a time returns the
 low half twice. And the wait loop is bounded on purpose: a missing drive floats
 the bus high, `BSY` never clears, and an honest `loop` there hangs the machine
 at boot with nothing printed.
+
+---
+
+### The first lock
+
+There was not one in this kernel until preemption arrived, and until then that
+was defensible: one core, a kernel that never got preempted, and
+`without_interrupts` as a complete critical section. The scheduler ended that
+quietly. The evidence is in this README, a few sections up —
+`once upon a timetasks`, two tasks' output interleaved mid-word. I presented it
+as proof of preemption. It was also a data race.
+
+**A kernel lock exists to stop re-entrancy, not just parallelism.** Take a lock
+in ordinary code, let the timer fire, and the handler tries to take the same
+lock on the same core. It spins forever, waiting for a holder that cannot
+possibly run again. That is a guaranteed hang on a single-core machine, which is
+why `SpinLock` disables interrupts for as long as it is held — and why the guard
+*restores* the previous interrupt state rather than blindly enabling it, so that
+a nested lock does not end the outer critical section early.
+
+But a spinlock is wrong for anything slow. Held across a fifteen-second
+generation it would suspend the timer for fifteen seconds: a machine that has a
+scheduler and never runs it. So there is a second primitive. A `Claim` leaves
+interrupts on, lets its holder be preempted freely, and simply refuses a second
+caller:
+
+```
+5am> spawn a robot went to the park
+  [task 1 started -- the prompt is still yours]
+5am> spawn a second story about a cat
+The model is already running somewhere else.
+There is one set of activations in this kernel, so a second
+generation would write into the first one's KV cache and both
+would produce confident nonsense. Try again when it finishes.
+```
+
+That was a real bug, one command away, and it produced no error — just fluent
+text assembled from two interleaved KV caches. Refusing rather than waiting is
+only honest because there is no blocked state to wait in yet.
 
 ---
 
@@ -734,6 +789,7 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   elf.rs         reads program headers and loads what they describe
   ata.rs         IDE disk reads, one sector at a time, through the CPU
   fat.rs         FAT16, read-only: root directory and cluster chains
+  sync.rs        a spinlock that disables interrupts, and a claim that does not
   user.rs        maps a stack and starts the loaded program
 bridge/          runs on your machine: serial <-> Claude API
 userland/        a program, not a kernel. built separately, loaded as ELF
@@ -755,6 +811,16 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
+- **No blocked state.** Tasks are `Ready` or `Finished`, never waiting. A task
+  that wants the model or a keystroke is refused or spins, rather than sleeping
+  until it is available. This is the next real gap.
+- **One address space.** Every task shares one CR3. Ring 3 is fenced off by the
+  user bit, not by isolation, so two user programs would see each other's
+  memory. "Task" is honest here; "process" would not be.
+- **`static mut` is still the idiom** for most kernel state, reached through
+  `addr_of_mut!`. Sound today because one core, and protected where it is
+  shared; the right long-term answer is `UnsafeCell` behind the locks that now
+  exist.
 - **The filesystem is read-only.** Nothing writes to the disk. Writing means
   allocating clusters and updating both copies of the table without leaving the
   volume inconsistent if the power goes out halfway, which is most of what a
