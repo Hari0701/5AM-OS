@@ -136,6 +136,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             narrate::step("mem ", "building the physical frame allocator");
             unsafe { memory::init(&boot_info.memory_regions, offset) };
 
+            // Ask the CPU to honour the no-execute bit before anything sets it.
+            // Until this succeeds, a page marked non-executable is executable
+            // anyway and nothing says so.
+            let nx = unsafe { memory::enable_no_execute() };
+            unsafe { memory::set_no_execute_active(nx) };
+            if nx {
+                println!("[mem ] no-execute enabled (EFER.NXE)");
+            } else {
+                println!("[mem ] this CPU has no NX bit; every page stays executable");
+            }
+
             narrate::step("heap", "mapping a heap -- Vec and String work after this line");
             match unsafe { heap::init() } {
                 Ok(()) => {}

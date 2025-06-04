@@ -124,6 +124,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | ATA PIO disk | working | The CPU personally carries every byte |
 | FAT16 (read-only) | working | A file is a linked list living in a table |
 | Locks | working | A kernel lock exists to stop re-entrancy, not just parallelism |
+| No-execute pages | working | A permission the CPU ignores until you ask it not to |
 
 ### Shell commands
 
@@ -813,7 +814,9 @@ because reading it is the point.
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
 - **No blocked state.** Tasks are `Ready` or `Finished`, never waiting. A task
   that wants the model or a keystroke is refused or spins, rather than sleeping
-  until it is available. This is the next real gap.
+  until it is available. This is the next real gap, and an attempt at it is
+  recorded in `docs/attempts/blocked-state.md` — it does not work yet, and the
+  reason it does not is more useful than a version that pretended to.
 - **One address space.** Every task shares one CR3. Ring 3 is fenced off by the
   user bit, not by isolation, so two user programs would see each other's
   memory. "Task" is honest here; "process" would not be.
@@ -829,8 +832,6 @@ because reading it is the point.
 - **No relocation.** Only `ET_EXEC` at a fixed address. Position-independent
   executables are refused rather than half-supported, because running one means
   choosing a base and applying relocations.
-- **No NX.** `EFER.NXE` is never set, so every mapped page is executable. A
-  segment marked `rw-` is a lie the loader currently tells.
 - **Userspace is not preemptible.** Ring 3 runs with interrupts disabled,
   because the timer entry does not yet understand a privilege change. One
   program at a time, and it must exit by syscall.

@@ -265,10 +265,13 @@ pub unsafe fn load(data: &[u8], verbose: bool) -> Result<Loaded, &'static str> {
         if flags & PF_W != 0 {
             page_flags |= memory::FLAG_WRITABLE;
         }
-        // Nothing is done with PF_X. Marking a page non-executable needs the NX
-        // bit and EFER.NXE, which this kernel does not enable -- so every page
-        // it maps is executable, and a segment marked rw- is a lie we are
-        // currently telling. Worth knowing about rather than hiding.
+        // A segment that is not marked executable gets the NX bit, so the
+        // permissions printed above are the permissions enforced. Without
+        // EFER.NXE this bit is ignored and every page stays executable, which
+        // is why `enable_no_execute` runs at boot and reports whether it took.
+        if flags & PF_X == 0 && memory::no_execute_active() {
+            page_flags |= memory::FLAG_NO_EXECUTE;
+        }
 
         let mut page = virtual_address & !(PAGE_SIZE as u64 - 1);
         let last = (virtual_address + memory_size - 1) & !(PAGE_SIZE as u64 - 1);

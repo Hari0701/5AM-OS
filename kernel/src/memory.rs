@@ -381,3 +381,76 @@ pub fn is_user_accessible(address: u64, len: u64) -> bool {
     }
     true
 }
+
+// --- no-execute ----------------------------------------------------------
+
+/// Bit 63 of a page table entry: fetching an instruction from this page faults.
+///
+/// The bit exists in every long-mode entry, and the CPU ignores it completely
+/// until `EFER.NXE` is set. That is why a kernel can mark pages non-executable,
+/// see no faults, and believe it worked -- the permission was written down and
+/// never enforced. This kernel spent its whole ELF-loader life in exactly that
+/// state, printing `rw-` for a segment that was fully executable.
+const NO_EXECUTE: u64 = 1 << 63;
+
+pub const FLAG_NO_EXECUTE: u64 = NO_EXECUTE;
+
+/// Enable the no-execute bit, if this CPU has it.
+///
+/// EFER is a Model Specific Register: a control register reached by number
+/// through `rdmsr`/`wrmsr` rather than by name. NXE is bit 11.
+///
+/// Support is not guaranteed, so it is asked for rather than assumed --
+/// CPUID leaf 0x8000_0001 reports it in EDX bit 20. Setting NXE on a CPU
+/// without it raises #GP, which would be a poor way to end the boot.
+///
+/// # Safety
+/// Changes how every page table entry in the system is interpreted. Must run
+/// before any entry sets bit 63.
+pub unsafe fn enable_no_execute() -> bool {
+    let supported: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 0x80000001",
+            "cpuid",
+            "pop rbx",
+            out("eax") _,
+            out("edx") supported,
+            out("ecx") _,
+            options(nostack),
+        );
+    }
+    if supported & (1 << 20) == 0 {
+        return false;
+    }
+
+    const EFER: u32 = 0xC000_0080;
+    unsafe {
+        let (low, high): (u32, u32);
+        asm!("rdmsr", in("ecx") EFER, out("eax") low, out("edx") high, options(nostack, preserves_flags));
+        let value = ((high as u64) << 32 | low as u64) | (1 << 11); // NXE
+        asm!(
+            "wrmsr",
+            in("ecx") EFER,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
+}
+
+/// Whether `enable_no_execute` succeeded, so callers can avoid setting a bit
+/// the CPU would treat as part of an address.
+static mut NO_EXECUTE_ACTIVE: bool = false;
+
+pub fn no_execute_active() -> bool {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(NO_EXECUTE_ACTIVE)) }
+}
+
+/// # Safety
+/// Call once, from `enable_no_execute`'s caller, with the value it returned.
+pub unsafe fn set_no_execute_active(active: bool) {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(NO_EXECUTE_ACTIVE), active) };
+}
