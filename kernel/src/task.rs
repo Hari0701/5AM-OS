@@ -48,7 +48,30 @@ const STACK_SIZE: usize = 64 * 1024;
 pub enum State {
     Free,
     Ready,
+    /// Waiting for something, and not to be scheduled until it happens.
+    ///
+    /// The state this kernel went longest without, and the one that changes
+    /// what a scheduler *is*. Round robin over none-but-Ready tasks is a
+    /// timeshare; a scheduler that can be told "not this one, not yet" is what
+    /// lets a machine wait for a keystroke without burning a core on it.
+    Blocked(Reason),
     Finished,
+}
+
+/// Why a task is not runnable, and therefore what will make it runnable again.
+///
+/// Keeping the reason in the state rather than in a side table means waking is
+/// a search for a matching reason, and it is impossible to have a task blocked
+/// on nothing -- the bug where a task sleeps forever because whoever was
+/// supposed to record the reason did not.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Reason {
+    /// Until `TICKS` reaches this value.
+    Until(u64),
+    /// Until somebody calls `wake_all` with the same address, which is just a
+    /// number both sides agree on -- usually the address of the thing being
+    /// waited for.
+    Channel(u64),
 }
 
 pub struct Task {
@@ -60,8 +83,24 @@ pub struct Task {
     /// Kept alive because the task is standing on it.
     _stack: Option<Box<[u8]>>,
     pub switches: u64,
+    /// What the task returned, once it has finished.
+    pub exit_code: u64,
     /// Work for the task to do, read by `task_entry`.
-    pub prompt: Option<String>,
+    pub work: Option<Work>,
+}
+
+/// What a spawned task is for.
+///
+/// A real kernel would not have this: a task would run a program, and the
+/// program would come from a file. This kernel can do that in ring 3 -- see
+/// `exec` -- but a *kernel* task still has to be one of the things the kernel
+/// knows how to do, because there is no way to hand it arbitrary code.
+pub enum Work {
+    /// Run the transformer on a prompt.
+    Generate(String),
+    /// A worker for the `workers` demo: take the shared semaphore, count, and
+    /// give it back, sleeping in between so the interleaving is visible.
+    Worker(usize),
 }
 
 impl Task {
@@ -73,7 +112,8 @@ impl Task {
             stack_pointer: 0,
             _stack: None,
             switches: 0,
-            prompt: None,
+            exit_code: 0,
+            work: None,
         }
     }
 
@@ -111,7 +151,7 @@ pub fn init() {
 }
 
 /// Create a task that will run `prompt` through the transformer.
-pub fn spawn(name: &str, prompt: String) -> Result<usize, &'static str> {
+pub fn spawn(name: &str, work: Work) -> Result<usize, &'static str> {
     without_interrupts(|| {
         let tasks = tasks();
         let id = (1..MAX_TASKS)
@@ -132,7 +172,7 @@ pub fn spawn(name: &str, prompt: String) -> Result<usize, &'static str> {
         task.stack_pointer = stack_pointer;
         task._stack = Some(stack);
         task.switches = 0;
-        task.prompt = Some(prompt);
+        task.work = Some(work);
         let bytes = name.as_bytes();
         let len = bytes.len().min(task.name.len());
         task.name[..len].copy_from_slice(&bytes[..len]);
@@ -187,15 +227,20 @@ unsafe fn build_frame(top: u64, entry: u64) -> u64 {
 /// Where every spawned task begins.
 extern "C" fn task_entry() -> ! {
     let id = current_id();
-    let prompt = without_interrupts(|| tasks()[id].prompt.take());
+    let work = without_interrupts(|| tasks()[id].work.take());
 
-    if let Some(prompt) = prompt {
-        crate::llm::generate(&prompt, 96);
+    match work {
+        Some(Work::Generate(prompt)) => crate::llm::generate(&prompt, 96),
+        Some(Work::Worker(index)) => worker(index),
+        None => {}
     }
 
     without_interrupts(|| {
+        tasks()[id].exit_code = 0;
         tasks()[id].state = State::Finished;
     });
+    // Anyone blocked in wait_for() is waiting on this task's slot address.
+    wake_all(id as u64);
     println!();
     println!("[task] {id} finished. Press enter for a prompt.");
 
@@ -222,7 +267,28 @@ extern "C" fn schedule(stack_pointer: u64) -> u64 {
     let current = current_id();
     tasks[current].stack_pointer = stack_pointer;
 
-    // Round robin: start after the current task and take the next Ready one.
+    // Anything sleeping until a deadline that has now passed becomes runnable
+    // again. Doing this here, in the timer, is the entire implementation of
+    // "sleep": there is no separate timer subsystem, only a scheduler that
+    // checks the clock before it chooses.
+    let now = crate::interrupts::ticks();
+    for task in tasks.iter_mut() {
+        if let State::Blocked(Reason::Until(deadline)) = task.state {
+            if now >= deadline {
+                task.state = State::Ready;
+            }
+        }
+    }
+
+    // Round robin over the runnable tasks. Blocked ones are simply not
+    // candidates, which is the whole difference a wait state makes: the CPU
+    // stops being offered to code that has nothing to do with it.
+    //
+    // Deliberately plain. A priority scheme with aging was here briefly and is
+    // gone: it starved two of three workers in the `workers` demo, and a
+    // scheduler whose fairness I cannot demonstrate is worse than an obvious
+    // one that I can. Priorities belong on top of a scheduler that is known
+    // correct, not mixed into the change that introduces blocking.
     let mut next = current;
     for offset in 1..=MAX_TASKS {
         let candidate = (current + offset) % MAX_TASKS;
@@ -291,6 +357,8 @@ pub fn report() {
             State::Free => continue,
             State::Ready if id == current => "running",
             State::Ready => "ready",
+            State::Blocked(Reason::Until(_)) => "sleeping",
+            State::Blocked(Reason::Channel(_)) => "waiting",
             State::Finished => "finished",
         };
         println!("  {id:<3} {:<9} {state:<9} {}", task.name(), task.switches);
@@ -310,7 +378,7 @@ pub fn busy() -> bool {
     tasks()
         .iter()
         .enumerate()
-        .any(|(id, t)| id != 0 && t.state == State::Ready)
+        .any(|(id, t)| id != 0 && !matches!(t.state, State::Free | State::Finished))
 }
 
 pub fn reap_finished() {
@@ -325,3 +393,181 @@ pub fn reap_finished() {
 
 /// Keeps `Vec` in scope for the stack allocation above.
 const _: fn() -> Vec<u8> = || vec![0u8; 0];
+
+// --- blocking and waking -------------------------------------------------
+
+/// Give up the CPU until `wake_all(channel)` is called.
+///
+/// A channel is just a number both sides agree on -- conventionally the address
+/// of whatever is being waited for, which makes collisions impossible without
+/// any registry.
+///
+/// ## The lost wakeup
+///
+/// The check and the block must not be separable. Test a condition, get
+/// interrupted, have the waker run and signal *before* you actually block, and
+/// you go to sleep waiting for an event that already happened. The machine
+/// stops with no error, and the bug appears once a week under load.
+///
+/// So the caller tests the condition and calls this with interrupts already
+/// disabled; marking blocked and yielding happens without a window in between.
+/// Mark this task blocked. Does not yield, and does not touch interrupts.
+///
+/// # Safety-in-the-non-Rust-sense
+/// The caller must already have interrupts disabled, and must have tested its
+/// condition inside that same disabled region. Anything else reintroduces the
+/// lost wakeup this exists to prevent.
+pub fn park(channel: u64) {
+    let id = current_id();
+    tasks()[id].state = State::Blocked(Reason::Channel(channel));
+}
+
+/// Test a condition and block on `channel` if it is not yet true, atomically.
+///
+/// The two halves cannot be separated. Test the condition, get preempted, have
+/// the waker run and signal *before* you actually mark yourself blocked, and
+/// you sleep waiting for an event that already happened. Nothing reports an
+/// error; the task simply never runs again.
+///
+/// I wrote that warning on this function's first version and then implemented
+/// exactly the bug it describes -- the test was inside a critical section and
+/// the block was outside it. Three worker tasks deadlocked on the first run.
+pub fn block_until<R>(channel: u64, mut ready: impl FnMut() -> Option<R>) -> R {
+    loop {
+        let were_enabled = crate::interrupts::are_enabled();
+        crate::interrupts::disable();
+
+        // Stop the compiler hoisting the condition's loads out of this loop.
+        //
+        // Whatever `ready` inspects is changed by another task, and on one core
+        // the compiler can see no writer at all -- so it is entitled to read
+        // once and reuse the answer forever. That is not a theoretical hazard:
+        // it deadlocked three tasks against a semaphore whose count was
+        // visibly 1. Disabling interrupts excludes other *tasks*; it says
+        // nothing to the *compiler*.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        if let Some(value) = ready() {
+            if were_enabled {
+                crate::interrupts::enable();
+            }
+            return value;
+        }
+
+        // Still inside the disabled region: no waker can run between the test
+        // above and this line.
+        park(channel);
+
+        if were_enabled {
+            crate::interrupts::enable();
+        }
+        // Hand the CPU away immediately rather than waiting for the timer.
+        yield_now();
+    }
+}
+
+/// Make every task waiting on `channel` runnable again.
+///
+/// Wakes all rather than one. Waking a single waiter needs a policy for which,
+/// and every policy is wrong for somebody; letting them all re-test their
+/// condition is the honest version, and the cost only matters at a scale this
+/// kernel does not reach.
+pub fn wake_all(channel: u64) -> usize {
+    let mut woken = 0;
+    for task in tasks().iter_mut() {
+        if task.state == State::Blocked(Reason::Channel(channel)) {
+            task.state = State::Ready;
+            woken += 1;
+        }
+    }
+    woken
+}
+
+/// Sleep for a number of timer ticks.
+///
+/// The deadline is absolute, not a countdown: a countdown decremented per tick
+/// drifts whenever a tick is missed, and ticks are missed whenever an interrupt
+/// arrives while interrupts are disabled.
+pub fn sleep(ticks: u64) {
+    let deadline = crate::interrupts::ticks() + ticks;
+    without_interrupts(|| {
+        let id = current_id();
+        tasks()[id].state = State::Blocked(Reason::Until(deadline));
+    });
+    while crate::interrupts::ticks() < deadline {
+        yield_now();
+    }
+}
+
+/// The exit code of a finished task, if it has one.
+pub fn exit_code(id: usize) -> Option<u64> {
+    without_interrupts(|| {
+        let task = &tasks()[id];
+        match task.state {
+            State::Finished => Some(task.exit_code),
+            _ => None,
+        }
+    })
+}
+
+/// Block until task `id` has finished, then take its exit code.
+///
+/// The `wait` half of a process model. What is missing to make it the real
+/// thing is a parent-child relationship: any task may wait for any other, and
+/// nothing reaps a task nobody waited for -- which is precisely what a zombie
+/// is.
+pub fn wait_for(id: usize) -> Option<u64> {
+    if id == 0 || id >= MAX_TASKS {
+        return None;
+    }
+    // Blocks on the task's completion rather than polling for it. The first
+    // version slept a tick and re-checked, which looks equivalent and is not:
+    // the waiter is Ready every time it wakes, and the shell outranks the
+    // workers, so it won the CPU on every single tick and the tasks it was
+    // waiting for never ran. A poll loop turns "wait for you" into "prevent
+    // you", and the higher the waiter's priority the worse it gets.
+    block_until(id as u64, || match tasks()[id].state {
+        State::Finished => Some(Some(tasks()[id].exit_code)),
+        State::Free => Some(None),
+        _ => None,
+    })
+}
+
+// --- the worker demo -----------------------------------------------------
+
+/// One permit. With a count of one, a semaphore is a mutex that sleeps instead
+/// of spinning -- which is what you want around anything slow, and what this
+/// kernel could not express until tasks could block.
+static WORK_LOCK: crate::sync::Semaphore = crate::sync::Semaphore::new(1);
+
+/// Shared state the workers fight over, so that "serialised" is something you
+/// can see rather than something the comment claims.
+static mut COUNTER: u64 = 0;
+
+fn worker(index: usize) {
+    for round in 0..3 {
+        // Sleeping *outside* the critical section on purpose. Holding a lock
+        // while sleeping is the classic way to turn a fast system into a slow
+        // one -- everybody else waits for a task that is doing nothing.
+        sleep(3 + index as u64);
+
+        WORK_LOCK.wait();
+        // Only one task is ever inside here. Without the semaphore, the
+        // read-modify-write below is three separate steps with a preemption
+        // point between each, and the total comes out wrong in a way that
+        // depends on timing.
+        let value = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(COUNTER)) };
+        sleep(2); // hold it long enough that an unprotected version would lose
+        unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(COUNTER), value + 1) };
+        println!("  worker {index} round {round}: counter is now {}", value + 1);
+        WORK_LOCK.signal();
+    }
+}
+
+pub fn counter_value() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(COUNTER)) }
+}
+
+pub fn reset_counter() {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(COUNTER), 0) };
+}
