@@ -38,7 +38,7 @@
 use crate::interrupts;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub struct SpinLock<T> {
     locked: AtomicBool,
@@ -226,5 +226,110 @@ impl Drop for ClaimGuard<'_> {
         // middle of generate(). That is the entire reason this is a guard and
         // not a pair of functions.
         self.claim.taken.store(false, Ordering::Release);
+    }
+}
+
+// --- semaphore -----------------------------------------------------------
+
+/// A counter you can wait on, built on the scheduler's blocked state.
+///
+/// This is the primitive [`SpinLock`] and [`Claim`] could not be. A spinlock
+/// burns the CPU while it waits and a claim refuses instead of waiting; a
+/// semaphore *sleeps*, which is only expressible once a task can be told "not
+/// runnable until somebody says so".
+///
+/// With a count of one it is a mutex that blocks rather than spins -- the right
+/// thing to hold across a disk read. With a count of N it is a permit pool. And
+/// the classic pairing of two, one counting full slots and one counting empty
+/// ones, is a bounded producer-consumer queue.
+///
+/// ## Why the loop around the wait
+///
+/// `wake_all` wakes every waiter, and only one of them can win the count. The
+/// others must re-test rather than assume, which is the same reason condition
+/// variables are always used in a `while` and never an `if`. A wakeup is a hint
+/// that the world may have changed, never a promise that it changed for you.
+pub struct Semaphore {
+    /// Atomic, and that is not decoration on a single-core kernel.
+    ///
+    /// The first version was a plain `u32` in an `UnsafeCell`, read and written
+    /// with interrupts disabled -- which is correct mutual exclusion and still
+    /// completely broken. `wait` re-tests this value in a loop, and nothing in
+    /// a plain load tells the compiler it can change: no other thread it can
+    /// see writes it, so LLVM hoists the load out of the loop and the waiter
+    /// spins forever on a register holding zero, while the real count sits at
+    /// one.
+    ///
+    /// Disabling interrupts stops another *task* from running. It says nothing
+    /// to the *compiler*. Those are different problems and they need different
+    /// tools, which is the entire lesson of this field.
+    count: AtomicU32,
+}
+
+impl Semaphore {
+    pub const fn new(count: u32) -> Self {
+        Self {
+            count: AtomicU32::new(count),
+        }
+    }
+
+    /// The address of this semaphore, used as the wait channel. Two different
+    /// semaphores can never collide, and no registry is needed to say so.
+    fn channel(&self) -> u64 {
+        self as *const _ as u64
+    }
+
+    /// Take one, sleeping until one is available.
+    ///
+    /// The test and the block are a single uninterruptible step -- see
+    /// `block_until`. Separating them is the lost wakeup, and it deadlocked
+    /// this exact demo the first time it ran.
+    pub fn wait(&self) {
+        crate::task::block_until(self.channel(), || self.try_take())
+    }
+
+    /// Decrement if positive, atomically.
+    ///
+    /// A load, a compare and a store as one indivisible step. Written as three
+    /// separate operations it would be the textbook lost-update race, which is
+    /// the very thing this type exists to prevent.
+    fn try_take(&self) -> Option<()> {
+        let mut current = self.count.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return None;
+            }
+            match self.count.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(()),
+                // Somebody moved it under us. Re-read and try again rather
+                // than assuming the value we last saw.
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Take one only if it is free.
+    pub fn try_wait(&self) -> bool {
+        self.try_take().is_some()
+    }
+
+    /// Give one back and wake anybody waiting.
+    ///
+    /// The count goes up before the wake, never after: a waiter that runs the
+    /// instant it is made runnable must find the resource already there.
+    pub fn signal(&self) {
+        self.count.fetch_add(1, Ordering::Release);
+        interrupts::without_interrupts(|| {
+            crate::task::wake_all(self.channel());
+        })
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count.load(Ordering::Acquire)
     }
 }
