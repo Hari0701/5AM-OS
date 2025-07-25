@@ -5,7 +5,7 @@
 //! and decodes the bytes that are actually there. If you change the kernel, the
 //! explanation changes with it, because there is nothing to keep in sync.
 
-use crate::keyboard::{self, Key};
+use crate::keyboard::{wait_key, Key};
 use crate::{gdt, interrupts, print, println};
 use bootloader_api::BootInfo;
 use bootloader_api::info::MemoryRegionKind;
@@ -29,15 +29,19 @@ pub fn run() -> ! {
     prompt();
 
     loop {
-        match next_key() {
-            Some(Key::Char(c)) => {
+        // Blocks. The task leaves the scheduler's rotation entirely until a
+        // key arrives, instead of being handed slices to rediscover that the
+        // buffer is empty. With a generation running, that is the difference
+        // between the model getting most of the CPU and half of it.
+        match wait_key() {
+            Key::Char(c) => {
                 if len < MAX_LINE {
                     line[len] = c as u8;
                     len += 1;
                     print!("{c}");
                 }
             }
-            Some(Key::Backspace) => {
+            Key::Backspace => {
                 if len > 0 {
                     len -= 1;
                     // Move back, overwrite with a space, move back again —
@@ -45,43 +49,16 @@ pub fn run() -> ! {
                     print!("\x08 \x08");
                 }
             }
-            Some(Key::Enter) => {
+            Key::Enter => {
                 println!();
                 let command = core::str::from_utf8(&line[..len]).unwrap_or("");
+                crate::task::reap_finished();
                 execute(command.trim());
                 len = 0;
                 prompt();
             }
-            None => {
-                // Nothing typed. Park the CPU until the next interrupt rather
-                // than spinning — this is the difference between a laptop with
-                // a cool fan and one without. With preemption on, the timer
-                // wakes us and may hand the CPU to another task first.
-                crate::task::reap_finished();
-                crate::task::yield_now();
-            }
         }
     }
-}
-
-/// Read a keypress from either input device.
-///
-/// The PS/2 keyboard is what you use in a VM window; the serial console is what
-/// you use in a terminal, over SSH, or on a machine with no keyboard. Both feed
-/// the same shell, and neither knows about the other.
-fn next_key() -> Option<Key> {
-    if let Some(byte) = crate::serial::read_input() {
-        return match byte {
-            b'\r' | b'\n' => Some(Key::Enter),
-            // Terminals disagree: most send DEL for backspace, some send BS.
-            0x08 | 0x7F => Some(Key::Backspace),
-            // Printable ASCII. Escape sequences (arrow keys and the like) begin
-            // with 0x1B and are dropped rather than pasted in as garbage.
-            0x20..=0x7E => Some(Key::Char(byte as char)),
-            _ => None,
-        };
-    }
-    keyboard::read_key()
 }
 
 fn banner() {
@@ -112,6 +89,8 @@ fn execute(command: &str) {
         "heap" => heap_status(),
         "tasks" => crate::task::report(),
         "spawn" => spawn(rest),
+        "workers" => workers(),
+        "sleep" => sleep_command(rest),
         "user" => user_mode(),
         "ls" => list_files(),
         "cat" => cat(rest),
@@ -163,6 +142,8 @@ fn help() {
     println!("                    keep using the shell while it thinks");
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
+    println!("  workers           three tasks share one semaphore, visibly");
+    println!("  sleep <ticks>     block this shell on the clock, not a spin");
     println!("  ls                list the files on the FAT16 disk");
     println!("  cat <file>        print a file from that disk");
     println!("  exec <file>       load an ELF off the disk and run it in ring 3");
@@ -321,6 +302,60 @@ fn regs() {
     println!("  RFLAGS {rflags:#018x}   IF={}", (rflags >> 9) & 1);
     println!("         IF is the interrupt flag. It is 1, which is why the");
     println!("         keyboard you just typed on works.");
+}
+
+/// Three tasks, one semaphore, one counter.
+///
+/// The point is the *absence* of interleaving inside the critical section.
+/// Every worker sleeps before it tries, so they genuinely contend; the counter
+/// still reaches exactly nine, because only one is ever inside.
+fn workers() {
+    crate::task::reset_counter();
+    println!();
+    println!("  Three workers, each incrementing a shared counter three times.");
+    println!("  Each holds a semaphore across a read, a sleep, and a write --");
+    println!("  without it, the read-modify-write would lose updates.");
+    println!();
+
+    let mut ids = [0usize; 3];
+    for (index, slot) in ids.iter_mut().enumerate() {
+        match crate::task::spawn("worker", crate::task::Work::Worker(index)) {
+            Ok(id) => *slot = id,
+            Err(error) => {
+                println!("  could not spawn worker {index}: {error}");
+                return;
+            }
+        }
+    }
+
+    // Block until every worker is done. The shell is asleep for all of this,
+    // not spinning -- which is the only reason the workers get the CPU.
+    for id in ids {
+        crate::task::wait_for(id);
+    }
+
+    let total = crate::task::counter_value();
+    println!();
+    println!("  final counter: {total} (expected 9)");
+    if total == 9 {
+        println!("  No updates lost. Nine increments, nine results.");
+    } else {
+        println!("  Updates were lost -- the critical section is not exclusive.");
+    }
+    crate::task::reap_finished();
+    println!();
+}
+
+fn sleep_command(argument: &str) {
+    let ticks: u64 = argument.trim().parse().unwrap_or(18);
+    let before = crate::interrupts::ticks();
+    println!("  sleeping {ticks} ticks ...");
+    crate::task::sleep(ticks);
+    println!(
+        "  awake after {} ticks. The shell was Blocked, not spinning:",
+        crate::interrupts::ticks() - before
+    );
+    println!("  the scheduler was not offering it the CPU at all.");
 }
 
 /// Everything the disk commands need: a mounted volume, or a reason why not.
@@ -509,7 +544,7 @@ fn spawn(prompt: &str) {
         println!("  Try it and then type `tasks` while the story is generating.");
         return;
     }
-    match crate::task::spawn("llm", prompt.to_string()) {
+    match crate::task::spawn("llm", crate::task::Work::Generate(prompt.to_string())) {
         Ok(id) => {
             println!("  [task {id} started -- the prompt is still yours]");
         }

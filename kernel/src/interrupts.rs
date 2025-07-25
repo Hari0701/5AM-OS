@@ -326,6 +326,7 @@ extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
     // another interrupt.
     let scancode = unsafe { inb(0x60) };
     keyboard::push_scancode(scancode);
+    crate::task::wake_all(keyboard::INPUT_CHANNEL);
     unsafe { end_of_interrupt(KEYBOARD_VECTOR) };
 }
 
@@ -338,6 +339,7 @@ extern "x86-interrupt" fn serial_irq(_frame: InterruptStackFrame) {
         while let Some(byte) = console.try_recv() {
             crate::serial::push_input(byte);
         }
+        crate::task::wake_all(keyboard::INPUT_CHANNEL);
         end_of_interrupt(SERIAL_VECTOR);
     }
 }

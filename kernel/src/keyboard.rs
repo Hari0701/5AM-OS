@@ -163,6 +163,45 @@ pub enum Key {
 }
 
 /// Pull one decoded key, if any input is waiting.
+/// The channel tasks sleep on while waiting for a keystroke.
+///
+/// A fixed number rather than an address, because both the IRQ handler and the
+/// shell need it and neither owns the other.
+pub const INPUT_CHANNEL: u64 = 0x5A4D_0001;
+
+/// Wait for a key, sleeping rather than spinning.
+///
+/// The old shell loop polled and halted, which parks the CPU but keeps the task
+/// runnable -- so with anything else running, the scheduler kept handing it
+/// slices to discover, again, that nothing had been typed. Blocking takes it
+/// out of the rotation entirely until a key actually arrives.
+pub fn wait_key() -> Key {
+    // Test and block as one uninterruptible step. A keystroke arriving between
+    // them would wake nobody, and the shell would then sleep until the *next*
+    // key -- one keypress permanently behind, forever.
+    crate::task::block_until(INPUT_CHANNEL, next_key)
+}
+
+/// A key from either console: the serial line or the PS/2 keyboard.
+///
+/// Both are real inputs and the shell must not care which one you used. Serial
+/// is checked first only because it is the one a remote user is on, and a
+/// dropped keystroke there is harder to notice.
+pub fn next_key() -> Option<Key> {
+    if let Some(byte) = crate::serial::read_input() {
+        return match byte {
+            b'\r' | b'\n' => Some(Key::Enter),
+            // Terminals disagree: most send DEL for backspace, some send BS.
+            0x08 | 0x7F => Some(Key::Backspace),
+            // Printable ASCII. Escape sequences (arrow keys and the like) begin
+            // with 0x1B and are dropped rather than pasted in as garbage.
+            0x20..=0x7E => Some(Key::Char(byte as char)),
+            _ => None,
+        };
+    }
+    read_key()
+}
+
 pub fn read_key() -> Option<Key> {
     loop {
         let scancode = pop_scancode()?;
