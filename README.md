@@ -125,6 +125,8 @@ ARM Mac is emulating x86 instruction by instruction.
 | FAT16 (read-only) | working | A file is a linked list living in a table |
 | Locks | working | A kernel lock exists to stop re-entrancy, not just parallelism |
 | No-execute pages | working | A permission the CPU ignores until you ask it not to |
+| Blocked tasks, sleep | working | A scheduler you can tell "not this one, not yet" |
+| Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
 
@@ -604,6 +606,66 @@ only honest because there is no blocked state to wait in yet.
 
 ---
 
+### Waiting
+
+Round robin over nothing-but-runnable tasks is a timeshare. A scheduler you can
+tell *"not this one, not yet"* is what lets a machine wait for a keystroke
+without burning a core on it — and until `State::Blocked` existed, this kernel
+could not.
+
+`sleep` needs no timer subsystem. The scheduler wakes anything whose deadline has
+passed before it chooses, which is the whole implementation. The shell now blocks
+for a keystroke rather than polling and halting: halting parks the CPU, but the
+task stays *runnable*, so with anything else running the scheduler kept handing
+it slices to rediscover that nobody had typed anything.
+
+```
+5am> workers
+  worker 0 round 0: counter is now 1
+  worker 1 round 0: counter is now 2
+  worker 2 round 0: counter is now 3
+  worker 0 round 1: counter is now 4
+  ...
+  final counter: 9 (expected 9)
+  No updates lost. Nine increments, nine results.
+```
+
+Each worker holds a semaphore across a read, a sleep and a write. Without
+exclusion the read-modify-write loses updates; the clean 0,1,2 rotation is the
+evidence that the blocking and the round robin are both fair.
+
+### The bug that cost the most so far
+
+Three tasks deadlocked. Two sat waiting forever — while the semaphore they were
+waiting for was **free**:
+
+```
+  WORK_LOCK count = 1
+  id  name      state     switches
+  0   shell     running   1
+  1   w         waiting   7
+  2   w         waiting   6
+```
+
+That is not a lost signal, it is a lost *read*. The count was a plain `u32`
+written and read with interrupts disabled — correct mutual exclusion, and still
+completely broken. `wait` re-tests it in a loop, nothing in a plain load tells
+the compiler it can change, and on one core LLVM can see no other writer. So it
+reads once and reuses the answer forever: the waiter spins on a register holding
+zero while memory holds one.
+
+**Disabling interrupts stops another task from running. It says nothing to the
+compiler.** Different problems, different tools — and this project had already
+made that mistake once, with the keyboard ring buffer.
+
+Reading the code did not find it; two other real bugs turned up that way and
+neither was the cause. What found it was bisection — four variants of the demo,
+each adding one feature, until only "semaphore held across a sleep" failed — and
+then printing the one number the theory depended on. The full postmortem is in
+[docs/attempts/blocked-state.md](docs/attempts/blocked-state.md).
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -790,7 +852,7 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   elf.rs         reads program headers and loads what they describe
   ata.rs         IDE disk reads, one sector at a time, through the CPU
   fat.rs         FAT16, read-only: root directory and cluster chains
-  sync.rs        a spinlock that disables interrupts, and a claim that does not
+  sync.rs        a spinlock, a claim, and a semaphore that sleeps
   user.rs        maps a stack and starts the loaded program
 bridge/          runs on your machine: serial <-> Claude API
 userland/        a program, not a kernel. built separately, loaded as ELF
@@ -812,11 +874,10 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
-- **No blocked state.** Tasks are `Ready` or `Finished`, never waiting. A task
-  that wants the model or a keystroke is refused or spins, rather than sleeping
-  until it is available. This is the next real gap, and an attempt at it is
-  recorded in `docs/attempts/blocked-state.md` — it does not work yet, and the
-  reason it does not is more useful than a version that pretended to.
+- **No priorities.** The scheduler is plain round robin over the runnable
+  tasks. A priority scheme with aging was written and deleted: it starved two of
+  three workers, and a scheduler whose fairness cannot be demonstrated is worse
+  than an obvious one that can.
 - **One address space.** Every task shares one CR3. Ring 3 is fenced off by the
   user bit, not by isolation, so two user programs would see each other's
   memory. "Task" is honest here; "process" would not be.
