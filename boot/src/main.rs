@@ -31,8 +31,18 @@ fn main() {
     //
     // Only one ramdisk is supported, and we need two files, so they are packed
     // into a single blob with a small header. See kernel/src/llm.rs.
-    if let Some(blob) = pack_assets(&out_dir) {
-        builder.set_ramdisk(&blob);
+    // ...and 58 MB is a lot to drag through BIOS disk services on every boot.
+    // Reading it costs about ninety seconds before the kernel runs at all,
+    // which is fine once and miserable when you are changing one line and
+    // rebooting to see what happened. So it is opt-in: `--ai` (or WITH_AI=1)
+    // includes it, and the default image boots in a couple of seconds.
+    let want_ai = std::env::var("WITH_AI").map(|v| v == "1").unwrap_or(false);
+    if want_ai {
+        if let Some(blob) = pack_assets(&out_dir) {
+            builder.set_ramdisk(&blob);
+        }
+    } else {
+        println!("note: no model in this image (run.sh --ai includes it)");
     }
 
     let bios = out_dir.join("5am-os-bios.img");

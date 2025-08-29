@@ -3,6 +3,13 @@
 #
 #   ./run.sh          boot with serial output in this terminal
 #   ./run.sh --gui    also open QEMU's display window
+#   ./run.sh --ai     include the 15M model (adds ~90s to every boot)
+#
+# The model is opt-in because it is 58 MB and the bootloader reads all of it
+# through BIOS disk services before the kernel gets its first instruction. That
+# is ninety seconds you wait every single boot. Without it the machine comes up
+# in about two, and everything except `llm`, `ask` and `spawn` works exactly the
+# same -- which is the right default when you are changing one line at a time.
 #
 # For the `ask` command, start bridge/bridge.py in another terminal first.
 set -euo pipefail
@@ -25,8 +32,16 @@ cargo build --package kernel \
 # 2. The image builder, for this machine.
 cargo build --package boot --release
 
+# Does this image carry the neural network?
+export WITH_AI=0
+for argument in "$@"; do
+  if [[ "$argument" == "--ai" ]]; then
+    export WITH_AI=1
+  fi
+done
+
 KERNEL="target/x86_64-5am_os/release/kernel"
-IMAGE="$(./target/release/boot "$KERNEL")"
+IMAGE="$(./target/release/boot "$KERNEL" | tail -n 1)"
 
 # 3. The filesystem, on a second disk.
 #
@@ -53,9 +68,11 @@ echo
 # 3.2, where a plain "${arr[@]}" on an EMPTY array counts as an unset variable
 # and trips `set -u` — so --gui aborted the script before QEMU ever started.
 DISPLAY_ARGS=(-display none)
-if [[ "${1:-}" == "--gui" ]]; then
-  DISPLAY_ARGS=()
-fi
+for argument in "$@"; do
+  if [[ "$argument" == "--gui" ]]; then
+    DISPLAY_ARGS=()
+  fi
+done
 
 # Two serial ports, in order: COM1 is the console you are reading, COM2 is the
 # AI bridge channel. QEMU maps -serial flags to COM1, COM2, ... in sequence, so
