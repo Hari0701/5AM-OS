@@ -90,6 +90,11 @@ fn execute(command: &str) {
         "tasks" => crate::task::report(),
         "spawn" => spawn(rest),
         "workers" => workers(),
+        "selftest" => {
+            println!();
+            crate::selftest::run(rest.trim());
+            println!();
+        }
         "sleep" => sleep_command(rest),
         "user" => user_mode(),
         "ls" => list_files(),
@@ -142,6 +147,8 @@ fn help() {
     println!("                    keep using the shell while it thinks");
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
+    println!("  selftest [suite]  run the kernel's tests against itself");
+    println!("                    suites: heap memory sync sched elf fat");
     println!("  workers           three tasks share one semaphore, visibly");
     println!("  sleep <ticks>     block this shell on the clock, not a spin");
     println!("  ls                list the files on the FAT16 disk");

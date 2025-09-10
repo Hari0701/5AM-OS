@@ -1,0 +1,418 @@
+//! Tests that run inside the machine they are testing.
+//!
+//! This kernel had none for most of its life, and the cost is written all over
+//! its history: an interrupt flag that was never restored, a loader that leaked
+//! every page it mapped, a semaphore whose count the compiler read once and
+//! cached forever. Every one of those shipped because the transcript *looked*
+//! right. A transcript is not a test if you only wrote down what you were
+//! hoping to see.
+//!
+//! ## Why they run in ring 0 and not on your laptop
+//!
+//! Most of what this kernel does cannot be tested anywhere else. `cargo test`
+//! on the host can check that an ELF header parses, but it cannot map a page,
+//! take a real page fault, switch a stack, or discover that the timer never
+//! fires again. The interesting failures are all failures of the *machine*, and
+//! the only honest place to look for them is on it.
+//!
+//! So: `selftest` in the shell. Each check prints its own line, the suite
+//! prints a count, and a learner who has just reimplemented the frame allocator
+//! finds out in two seconds whether it works.
+//!
+//! ## Writing a check
+//!
+//! Prove behaviour, not the absence of a crash. `heap: alloc did not panic` is
+//! worthless; `heap: 400 interleaved cycles return every byte and leave one
+//! hole` is the property that actually breaks when coalescing is wrong.
+
+use crate::{memory, println};
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
+pub struct Report {
+    pub passed: usize,
+    pub failed: usize,
+}
+
+impl Report {
+    fn new() -> Self {
+        Self {
+            passed: 0,
+            failed: 0,
+        }
+    }
+
+    /// Record one check. `detail` is printed either way, because a passing
+    /// check that prints its measurement is documentation and a passing check
+    /// that prints "ok" is noise.
+    fn check(&mut self, name: &str, passed: bool, detail: core::fmt::Arguments) {
+        if passed {
+            self.passed += 1;
+            println!("    pass  {name:<28} {detail}");
+        } else {
+            self.failed += 1;
+            println!("    FAIL  {name:<28} {detail}");
+        }
+    }
+}
+
+macro_rules! check {
+    ($report:expr, $name:expr, $condition:expr, $($detail:tt)*) => {
+        $report.check($name, $condition, format_args!($($detail)*))
+    };
+}
+
+/// Run one suite, or every suite.
+pub fn run(which: &str) {
+    let mut report = Report::new();
+
+    let all = which.is_empty() || which == "all";
+    if all || which == "heap" {
+        println!("  heap");
+        heap(&mut report);
+    }
+    if all || which == "memory" {
+        println!("  memory");
+        memory_suite(&mut report);
+    }
+    if all || which == "sync" {
+        println!("  sync");
+        sync(&mut report);
+    }
+    if all || which == "sched" {
+        println!("  sched");
+        sched(&mut report);
+    }
+    if all || which == "elf" {
+        println!("  elf");
+        elf(&mut report);
+    }
+    if all || which == "fat" {
+        println!("  fat");
+        fat(&mut report);
+    }
+
+    println!();
+    if report.failed == 0 {
+        println!("  {} passed, 0 failed.", report.passed);
+    } else {
+        println!(
+            "  {} passed, {} FAILED.",
+            report.passed, report.failed
+        );
+    }
+}
+
+// --- suites --------------------------------------------------------------
+
+fn heap(report: &mut Report) {
+    let before = crate::heap::stats();
+
+    // Allocation has to survive being used, not merely return a pointer.
+    let mut values: Vec<u64> = Vec::new();
+    for index in 0..64u64 {
+        values.push(index * index);
+    }
+    check!(
+        report,
+        "vec grows and keeps values",
+        values[63] == 63 * 63 && values.len() == 64,
+        "last = {}",
+        values[63]
+    );
+
+    // Alignment is the requirement a naive bump allocator quietly ignores until
+    // something does an aligned SSE store into the memory it handed out.
+    let aligned: Box<u64> = Box::new(0xDEAD_BEEF);
+    let address = &*aligned as *const u64 as usize;
+    check!(
+        report,
+        "u64 is 8-byte aligned",
+        address % 8 == 0,
+        "at {address:#x}"
+    );
+
+    drop(values);
+    drop(aligned);
+
+    let after_drop = crate::heap::stats();
+    check!(
+        report,
+        "every byte comes back",
+        after_drop.0 == before.0,
+        "{} free before, {} after",
+        before.0,
+        after_drop.0
+    );
+
+    // The property that actually breaks: without coalescing, the hole count
+    // climbs on every cycle until a large allocation cannot fit.
+    for _ in 0..200 {
+        let a: Vec<u8> = vec![0; 96];
+        let b: Vec<u8> = vec![0; 300];
+        drop(a);
+        let c: Vec<u8> = vec![0; 64];
+        drop(b);
+        drop(c);
+    }
+    let after_cycles = crate::heap::stats();
+    check!(
+        report,
+        "200 cycles leave one hole",
+        after_cycles.1 == 1 && after_cycles.0 == before.0,
+        "{} holes, {} bytes free",
+        after_cycles.1,
+        after_cycles.0
+    );
+}
+
+fn memory_suite(report: &mut Report) {
+    let (free_before, _) = memory::allocator().stats();
+
+    let Some(frame) = memory::allocator().allocate() else {
+        check!(report, "allocate a frame", false, "allocator is empty");
+        return;
+    };
+
+    // Somewhere in userspace territory that nothing else is using.
+    const SCRATCH: u64 = 0x0000_3000_0000;
+
+    let mapped = unsafe { memory::map_page(SCRATCH, frame, memory::FLAG_WRITABLE) };
+    check!(
+        report,
+        "map a page",
+        mapped.is_ok(),
+        "{SCRATCH:#x} -> {frame:#x}"
+    );
+    if mapped.is_err() {
+        unsafe { memory::allocator().deallocate(frame) };
+        return;
+    }
+
+    // A mapping you cannot write to is not a mapping.
+    const MARKER: u64 = 0x5A4D_0501_5A4D_0501;
+    unsafe {
+        core::ptr::write_volatile(SCRATCH as *mut u64, MARKER);
+    }
+    let read_back = unsafe { core::ptr::read_volatile(SCRATCH as *const u64) };
+    check!(
+        report,
+        "the page is writable",
+        read_back == MARKER,
+        "read {read_back:#x}"
+    );
+
+    // The walk must agree with what we asked for. This is the check that fails
+    // when the four table indexes are computed with the wrong shifts.
+    match memory::translate(SCRATCH) {
+        Some((physical, _)) => check!(
+            report,
+            "translate finds the frame",
+            physical == frame,
+            "walk says {physical:#x}, expected {frame:#x}"
+        ),
+        None => check!(report, "translate finds the frame", false, "not mapped"),
+    }
+
+    // And unmapping must actually unmap, or the next owner of this frame shares
+    // it with whoever held it before.
+    let returned = unsafe { memory::unmap_page(SCRATCH) };
+    check!(
+        report,
+        "unmap returns the frame",
+        returned == Some(frame),
+        "{returned:?}"
+    );
+    check!(
+        report,
+        "translate now fails",
+        memory::translate(SCRATCH).is_none(),
+        "still mapped"
+    );
+
+    unsafe { memory::allocator().deallocate(frame) };
+    let (free_after, _) = memory::allocator().stats();
+    check!(
+        report,
+        "no frames leaked",
+        free_after == free_before,
+        "{free_before} before, {free_after} after"
+    );
+}
+
+fn sync(report: &mut Report) {
+    use crate::sync::Semaphore;
+
+    let semaphore = Semaphore::new(2);
+    check!(
+        report,
+        "starts with its count",
+        semaphore.count() == 2,
+        "count = {}",
+        semaphore.count()
+    );
+
+    check!(
+        report,
+        "try_wait takes one",
+        semaphore.try_wait() && semaphore.count() == 1,
+        "count = {}",
+        semaphore.count()
+    );
+
+    semaphore.try_wait();
+    check!(
+        report,
+        "try_wait fails at zero",
+        !semaphore.try_wait(),
+        "count = {}",
+        semaphore.count()
+    );
+
+    semaphore.signal();
+    check!(
+        report,
+        "signal gives one back",
+        semaphore.count() == 1,
+        "count = {}",
+        semaphore.count()
+    );
+}
+
+fn sched(report: &mut Report) {
+    let start = crate::interrupts::ticks();
+    crate::task::sleep(5);
+    let slept = crate::interrupts::ticks() - start;
+    check!(
+        report,
+        "sleep waits at least as long",
+        slept >= 5,
+        "asked 5, slept {slept}"
+    );
+
+    // The real one: three tasks, one semaphore, a shared counter. This is the
+    // test that would have caught the compiler caching the semaphore's count --
+    // it deadlocked with the resource free and two tasks asleep.
+    crate::task::reset_counter();
+    let mut ids = [0usize; 3];
+    let mut spawned = true;
+    for (index, slot) in ids.iter_mut().enumerate() {
+        match crate::task::spawn("test", crate::task::Work::Worker(index)) {
+            Ok(id) => *slot = id,
+            Err(_) => spawned = false,
+        }
+    }
+    if !spawned {
+        check!(report, "spawn three workers", false, "no free task slots");
+        return;
+    }
+    for id in ids {
+        crate::task::wait_for(id);
+    }
+    let total = crate::task::counter_value();
+    check!(
+        report,
+        "nine increments, none lost",
+        total == 9,
+        "counter = {total}"
+    );
+    crate::task::reap_finished();
+}
+
+fn elf(report: &mut Report) {
+    let program = crate::user::embedded_program();
+
+    let (free_before, _) = memory::allocator().stats();
+    match unsafe { crate::elf::load(program, false) } {
+        Ok(loaded) => {
+            check!(
+                report,
+                "loads the embedded program",
+                loaded.entry != 0 && loaded.segments >= 1,
+                "entry {:#x}, {} segments",
+                loaded.entry,
+                loaded.segments
+            );
+            let freed = unsafe { memory::release(&loaded.pages) };
+            let (free_after, _) = memory::allocator().stats();
+            check!(
+                report,
+                "release returns every page",
+                free_after == free_before,
+                "{freed} freed, {free_before} -> {free_after}"
+            );
+        }
+        Err(error) => check!(report, "loads the embedded program", false, "{error}"),
+    }
+
+    // A loader that guesses is a loader that runs somebody else's bytes. These
+    // must be refused, not tolerated.
+    let mut broken = Vec::from(program);
+    broken[0] = 0;
+    check!(
+        report,
+        "rejects a bad magic",
+        unsafe { crate::elf::load(&broken, false) }.is_err(),
+        "accepted a non-ELF file"
+    );
+
+    check!(
+        report,
+        "rejects a truncated file",
+        unsafe { crate::elf::load(&program[..32], false) }.is_err(),
+        "accepted 32 bytes"
+    );
+}
+
+fn fat(report: &mut Report) {
+    let volume = match crate::fat::mount() {
+        Ok(volume) => volume,
+        Err(error) => {
+            println!("    skip  no disk attached ({error})");
+            return;
+        }
+    };
+
+    match volume.find("hello.elf") {
+        Ok(entry) => {
+            check!(
+                report,
+                "finds hello.elf",
+                entry.size > 0,
+                "{} bytes",
+                entry.size
+            );
+            match volume.read_file(&entry) {
+                Ok(data) => {
+                    check!(
+                        report,
+                        "reads the whole file",
+                        data.len() == entry.size as usize,
+                        "{} of {} bytes",
+                        data.len(),
+                        entry.size
+                    );
+                    // Following the cluster chain correctly means the bytes are
+                    // the ones the linker produced, not just the right count.
+                    check!(
+                        report,
+                        "the bytes are an ELF",
+                        data.len() > 4 && &data[0..4] == b"\x7fELF",
+                        "starts {:02x?}",
+                        &data[..4.min(data.len())]
+                    );
+                }
+                Err(error) => check!(report, "reads the whole file", false, "{error}"),
+            }
+        }
+        Err(error) => check!(report, "finds hello.elf", false, "{error}"),
+    }
+
+    check!(
+        report,
+        "a missing file is an error",
+        volume.find("nope.txt").is_err(),
+        "found a file that is not there"
+    );
+}

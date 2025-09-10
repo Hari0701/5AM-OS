@@ -27,6 +27,12 @@ static PROGRAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
 const USER_STACK_ADDRESS: u64 = 0x10_0000;
 const USER_STACK_PAGES: u64 = 4;
 
+/// The program baked into the kernel image, for tests that need a known-good
+/// ELF without a disk.
+pub fn embedded_program() -> &'static [u8] {
+    PROGRAM
+}
+
 /// Run the copy of the program that was built into the kernel image.
 pub fn run() {
     println!("  The program is a {} byte ELF file, built separately.", PROGRAM.len());
