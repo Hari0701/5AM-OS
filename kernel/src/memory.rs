@@ -273,32 +273,71 @@ pub fn translate(virtual_address: u64) -> Option<(u64, [u64; 4])> {
 /// standing on it.
 pub unsafe fn unmap_page(virtual_address: u64) -> Option<u64> {
     let indexes = indexes(virtual_address);
-    let mut table = read_cr3();
 
-    for level in 0..3 {
+    // Remember the whole path down, because pruning is a walk back up it.
+    let mut tables = [0u64; 4];
+    let mut table = read_cr3();
+    for level in 0..4 {
+        tables[level] = table;
         let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(indexes[level]) };
         if entry & PRESENT == 0 {
             return None;
         }
-        table = entry & ADDRESS_MASK;
+        if level < 3 {
+            table = entry & ADDRESS_MASK;
+        }
     }
 
-    let entry_ptr = (physical_to_virtual(table) as *mut u64).add(indexes[3]);
-    let entry = unsafe { *entry_ptr };
+    let leaf_ptr = (physical_to_virtual(tables[3]) as *mut u64).add(indexes[3]);
+    let entry = unsafe { *leaf_ptr };
     if entry & PRESENT == 0 {
         return None;
     }
 
     unsafe {
-        *entry_ptr = 0;
+        *leaf_ptr = 0;
         // Without this the CPU keeps serving the old translation out of the
-        // TLB, and the page stays readable after it has been handed to someone
-        // else -- a bug that looks like memory corruption in an unrelated
-        // subsystem.
+        // TLB, and the page stays readable at the old address after the frame
+        // belongs to somebody else -- which presents as memory corruption in an
+        // unrelated subsystem.
         asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
     }
 
+    // Now give back the tables that this was the last entry in.
+    //
+    // The first version of this did not, and said so in a comment: reclaiming a
+    // table means proving all 512 of its entries are dead, and freeing one that
+    // something else is still walking is catastrophic. The proof turns out to be
+    // cheap -- read 512 words and check they are zero -- and the emptiness test
+    // is what makes it safe in general. A table the bootloader also has
+    // mappings in is, by definition, not empty, so it is never touched.
+    //
+    // Deepest first, and stop at the first table that still has something in
+    // it. The top-level table is never freed: it is what CR3 points at.
+    for level in (1..4).rev() {
+        if !table_is_empty(tables[level]) {
+            break;
+        }
+        let parent = (physical_to_virtual(tables[level - 1]) as *mut u64).add(indexes[level - 1]);
+        unsafe {
+            *parent = 0;
+            allocator().deallocate(tables[level]);
+            asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
+        }
+    }
+
     Some(entry & ADDRESS_MASK)
+}
+
+/// Does this table have no present entries left?
+fn table_is_empty(table: u64) -> bool {
+    let base = physical_to_virtual(table) as *const u64;
+    for index in 0..512 {
+        if unsafe { *base.add(index) } & PRESENT != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Unmap a range and return every frame to the allocator.
