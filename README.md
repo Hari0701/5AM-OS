@@ -55,8 +55,14 @@ PS/2 keyboard. Quit with **Ctrl-A** then **X**.
 keyboard instead. Both drive the same shell.
 
 The first build compiles `core` from source (see below) and takes a few minutes.
-Boot then takes ~90 seconds, almost all of it the bootloader pulling 58 MB of
-model weights through BIOS disk services before the kernel ever runs.
+After that it boots in about two seconds.
+
+`./run.sh --ai` also packs in the 15M-parameter model, which `llm`, `ask` and
+`spawn` need. That costs about ninety seconds on **every** boot, almost all of
+it the bootloader pulling 58 MB through BIOS disk services before the kernel
+runs at all. It is opt-in for that reason: when you are changing one line and
+rebooting to see what happened, ninety seconds is the difference between working
+on this and giving up on it.
 
 ---
 
@@ -126,6 +132,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Locks | working | A kernel lock exists to stop re-entrancy, not just parallelism |
 | No-execute pages | working | A permission the CPU ignores until you ask it not to |
 | Blocked tasks, sleep | working | A scheduler you can tell "not this one, not yet" |
+| Self-tests | working | The only honest place to test a kernel is on the machine |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -666,6 +673,70 @@ then printing the one number the theory depended on. The full postmortem is in
 
 ---
 
+## Learning it
+
+Reading this kernel will teach you less than you would think. Every hard
+decision in it is already made, correctly, with a comment explaining why — which
+is exactly the problem. Nobody learned the stack-alignment rule from a comment. I
+learned it from a `#GP` with error code 0, and the comment is what was left over.
+
+So there are labs, in [exercises/](exercises/). Each one names a function, tells
+you to delete its body, and gives you a command that says whether your
+replacement is right:
+
+```
+5am> selftest memory
+    pass  map a page                   0x30000000 -> 0x1fddb000
+    pass  the page is writable         read 0x5a4d05015a4d0501
+    FAIL  translate finds the frame    walk says 0x0, expected 0x1fddb000
+```
+
+| # | Lab | You implement |
+| --- | --- | --- |
+| 1 | [Frame allocator](exercises/01-frame-allocator.md) | Physical memory bookkeeping, with nowhere to put the bookkeeping |
+| 2 | [Page tables](exercises/02-page-tables.md) | The four reads behind every memory access |
+| 3 | [Heap](exercises/03-heap.md) | Where `Vec` and `Box` come from |
+| 4 | [Context switch](exercises/04-context-switch.md) | Making one CPU look like several |
+| 5 | [Semaphore](exercises/05-semaphore.md) | Waiting without spinning |
+| 6 | [ELF loader](exercises/06-elf-loader.md) | Running a program you did not compile |
+| 7 | [Filesystem](exercises/07-filesystem.md) | Reading a file off a real disk |
+
+The tests run **inside the machine**, because that is the only honest place to
+check whether a page really got mapped. `cargo test` on your laptop can verify
+that an ELF header parses; it cannot take a page fault, switch a stack, or
+notice that the timer never fires again.
+
+`selftest` on its own runs all six suites. It found two real leaks the first
+time it ran, in code that had been working for weeks.
+
+### One rule
+
+**A passing transcript is not a passing test.** Three separate bugs shipped in
+this kernel because the output looked exactly like what I was hoping to see —
+including one that left the machine unable to receive a single keystroke, with a
+flawless-looking transcript above it. When your lab prints the right first line,
+that is the moment to get suspicious, not the moment to stop.
+
+The postmortem of the worst one is in
+[docs/attempts/blocked-state.md](docs/attempts/blocked-state.md): what found it
+was not reading the code — that surfaced two other real bugs which were not the
+cause — but bisecting four variants of a demo until only one failed, then
+printing the single number the theory rested on.
+
+---
+
+## About this repository's history
+
+The commits are ordered the way the kernel was built, and each message explains a
+real decision and often a real failure. That order is deliberately useful — you
+can read the log as a curriculum.
+
+**The dates are not real.** The repository was created in 2023 and the work is
+recent; the timeline in the log is constructed. The code, the bugs, the
+debugging and the reasoning in those messages all happened. The calendar did not.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -853,11 +924,13 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   ata.rs         IDE disk reads, one sector at a time, through the CPU
   fat.rs         FAT16, read-only: root directory and cluster chains
   sync.rs        a spinlock, a claim, and a semaphore that sleeps
+  selftest.rs    the suites behind `selftest`, and the labs' pass/fail
   user.rs        maps a stack and starts the loaded program
 bridge/          runs on your machine: serial <-> Claude API
 userland/        a program, not a kernel. built separately, loaded as ELF
 mkfs/            runs on your machine: writes the FAT16 disk image
 disk/            text files that end up on that disk
+exercises/       labs: delete a function, put it back, run the tests
 boot/            runs on your machine: wraps the kernel in a disk image
 run.sh           build + boot
 ```
