@@ -42,6 +42,12 @@ use alloc::vec::Vec;
 use core::arch::naked_asm;
 
 pub const MAX_TASKS: usize = 8;
+/// Lowest priority number that means anything. Bounded on purpose -- the aging
+/// counter is not, and that asymmetry is what forbids starvation.
+pub const MAX_PRIORITY: u8 = 15;
+pub const DEFAULT_PRIORITY: u8 = 8;
+/// The shell outranks everything: it is the only task a person is waiting on.
+pub const SHELL_PRIORITY: u8 = 0;
 const STACK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -83,6 +89,16 @@ pub struct Task {
     /// Kept alive because the task is standing on it.
     _stack: Option<Box<[u8]>>,
     pub switches: u64,
+    /// Lower runs first. 0 is the shell; background work sits well below it.
+    pub priority: u8,
+    /// Scheduling rounds this task has been passed over.
+    ///
+    /// Subtracted from `priority`, and that subtraction is the entire
+    /// anti-starvation argument. Priorities are bounded (0..=MAX_PRIORITY) and
+    /// this is not, so a task skipped MAX_PRIORITY+1 times outranks anything
+    /// on the machine. Starvation is therefore not merely unlikely, it is
+    /// impossible, with a stated bound.
+    pub waited: u16,
     /// What the task returned, once it has finished.
     pub exit_code: u64,
     /// Work for the task to do, read by `task_entry`.
@@ -101,6 +117,11 @@ pub enum Work {
     /// A worker for the `workers` demo: take the shared semaphore, count, and
     /// give it back, sleeping in between so the interleaving is visible.
     Worker(usize),
+    /// Spin without ever blocking, until `ticks` have passed. Used to prove
+    /// that a task which never yields cannot starve a lower-priority one.
+    Hog(u64),
+    /// Count as fast as it is given the CPU, until told to stop.
+    Spinner,
 }
 
 impl Task {
@@ -112,6 +133,8 @@ impl Task {
             stack_pointer: 0,
             _stack: None,
             switches: 0,
+            priority: DEFAULT_PRIORITY,
+            waited: 0,
             exit_code: 0,
             work: None,
         }
@@ -144,6 +167,7 @@ pub fn init() {
     let name = b"shell";
     tasks[0].name[..name.len()].copy_from_slice(name);
     tasks[0].name_len = name.len();
+    tasks[0].priority = SHELL_PRIORITY;
     unsafe {
         CURRENT = 0;
         ENABLED = true;
@@ -152,6 +176,14 @@ pub fn init() {
 
 /// Create a task that will run `prompt` through the transformer.
 pub fn spawn(name: &str, work: Work) -> Result<usize, &'static str> {
+    spawn_with_priority(name, work, DEFAULT_PRIORITY)
+}
+
+pub fn spawn_with_priority(
+    name: &str,
+    work: Work,
+    priority: u8,
+) -> Result<usize, &'static str> {
     without_interrupts(|| {
         let tasks = tasks();
         let id = (1..MAX_TASKS)
@@ -173,6 +205,7 @@ pub fn spawn(name: &str, work: Work) -> Result<usize, &'static str> {
         task._stack = Some(stack);
         task.switches = 0;
         task.work = Some(work);
+        task.priority = priority.min(MAX_PRIORITY);
         let bytes = name.as_bytes();
         let len = bytes.len().min(task.name.len());
         task.name[..len].copy_from_slice(&bytes[..len]);
@@ -232,6 +265,19 @@ extern "C" fn task_entry() -> ! {
     match work {
         Some(Work::Generate(prompt)) => crate::llm::generate(&prompt, 96),
         Some(Work::Worker(index)) => worker(index),
+        Some(Work::Hog(ticks)) => {
+            // Deliberately never blocks and never sleeps. A plain priority
+            // scheduler hands this task the CPU forever.
+            let deadline = crate::interrupts::ticks() + ticks;
+            while crate::interrupts::ticks() < deadline {
+                core::hint::spin_loop();
+            }
+        }
+        Some(Work::Spinner) => {
+            while !STOP_SPINNING.load(core::sync::atomic::Ordering::Acquire) {
+                SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         None => {}
     }
 
@@ -280,23 +326,39 @@ extern "C" fn schedule(stack_pointer: u64) -> u64 {
         }
     }
 
-    // Round robin over the runnable tasks. Blocked ones are simply not
-    // candidates, which is the whole difference a wait state makes: the CPU
-    // stops being offered to code that has nothing to do with it.
+    // Choose by effective priority, which is the stated priority minus how
+    // long the task has been passed over.
     //
-    // Deliberately plain. A priority scheme with aging was here briefly and is
-    // gone: it starved two of three workers in the `workers` demo, and a
-    // scheduler whose fairness I cannot demonstrate is worse than an obvious
-    // one that I can. Priorities belong on top of a scheduler that is known
-    // correct, not mixed into the change that introduces blocking.
+    // A plain priority scheduler starves its lowest priority task forever, and
+    // the version of this that was here before did exactly that. What was
+    // actually wrong then was `wait_for` polling -- the waiter came back Ready
+    // on every tick, outranked everything, and prevented the very task it was
+    // waiting for. Priorities took the blame. Now that waiting genuinely
+    // blocks, this can be reinstated with a bound rather than a hope.
     let mut next = current;
+    let mut best = i32::MAX;
     for offset in 1..=MAX_TASKS {
         let candidate = (current + offset) % MAX_TASKS;
-        if tasks[candidate].state == State::Ready {
+        if tasks[candidate].state != State::Ready {
+            continue;
+        }
+        let effective = tasks[candidate].priority as i32 - tasks[candidate].waited as i32;
+        // Strictly less, and the scan starts just after the current task, so
+        // equal-priority tasks rotate rather than the lowest id always winning.
+        if effective < best {
+            best = effective;
             next = candidate;
-            break;
         }
     }
+
+    // Age everyone who was runnable and did not get it. Unbounded growth here
+    // is deliberate: see `waited`.
+    for (id, task) in tasks.iter_mut().enumerate() {
+        if task.state == State::Ready && id != next {
+            task.waited = task.waited.saturating_add(1);
+        }
+    }
+    tasks[next].waited = 0;
 
     if next != current {
         unsafe { CURRENT = next };
@@ -351,7 +413,7 @@ pub fn report() {
     if crate::llm::busy() {
         println!("  the model is claimed by one task (only one may run it)");
     }
-    println!("  id  name      state     switches");
+    println!("  id  name      state     prio switches");
     for (id, task) in tasks.iter().enumerate() {
         let state = match task.state {
             State::Free => continue,
@@ -361,7 +423,12 @@ pub fn report() {
             State::Blocked(Reason::Channel(_)) => "waiting",
             State::Finished => "finished",
         };
-        println!("  {id:<3} {:<9} {state:<9} {}", task.name(), task.switches);
+        println!(
+            "  {id:<3} {:<9} {state:<9} {:<4} {}",
+            task.name(),
+            task.priority,
+            task.switches
+        );
     }
 }
 
@@ -563,6 +630,12 @@ fn worker(index: usize) {
         WORK_LOCK.signal();
     }
 }
+
+// --- the starvation experiment -------------------------------------------
+
+pub static SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static STOP_SPINNING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 pub fn counter_value() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(COUNTER)) }

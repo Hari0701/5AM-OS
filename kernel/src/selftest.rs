@@ -84,6 +84,10 @@ pub fn run(which: &str) {
         println!("  sched");
         sched(&mut report);
     }
+    if all || which == "priority" {
+        println!("  priority");
+        priority(&mut report);
+    }
     if all || which == "elf" {
         println!("  elf");
         elf(&mut report);
@@ -316,6 +320,48 @@ fn sched(report: &mut Report) {
         "nine increments, none lost",
         total == 9,
         "counter = {total}"
+    );
+    crate::task::reap_finished();
+}
+
+/// Can a task that never yields starve one below it?
+///
+/// The hog runs at the top priority and never blocks, sleeps or yields. The
+/// spinner runs at the bottom and only counts. Under a plain priority
+/// scheduler the spinner never runs at all and this returns zero; under aging
+/// it gets the CPU every MAX_PRIORITY+1 rounds or better.
+///
+/// Bounded on purpose -- the hog exits on a deadline whatever happens, so a
+/// broken scheduler fails this check rather than hanging the machine.
+fn priority(report: &mut Report) {
+    use core::sync::atomic::Ordering;
+
+    crate::task::SPINS.store(0, Ordering::Release);
+    crate::task::STOP_SPINNING.store(false, Ordering::Release);
+
+    let spinner = crate::task::spawn_with_priority(
+        "spin",
+        crate::task::Work::Spinner,
+        crate::task::MAX_PRIORITY,
+    );
+    let hog = crate::task::spawn_with_priority("hog", crate::task::Work::Hog(20), 0);
+
+    let (Ok(spinner), Ok(hog)) = (spinner, hog) else {
+        check!(report, "spawn hog and spinner", false, "no free task slots");
+        crate::task::STOP_SPINNING.store(true, Ordering::Release);
+        return;
+    };
+
+    crate::task::wait_for(hog);
+    let spins = crate::task::SPINS.load(Ordering::Acquire);
+    crate::task::STOP_SPINNING.store(true, Ordering::Release);
+    crate::task::wait_for(spinner);
+
+    check!(
+        report,
+        "aging beats a spinning hog",
+        spins > 0,
+        "lowest-priority task ran {spins} times while priority 0 spun"
     );
     crate::task::reap_finished();
 }
