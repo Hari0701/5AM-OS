@@ -99,6 +99,8 @@ fn execute(command: &str) {
         "user" => user_mode(),
         "ls" => list_files(),
         "cat" => cat(rest),
+        "write" => write_file(rest),
+        "rm" => remove_file(rest),
         "exec" => exec(rest),
         "translate" => translate(rest),
         "llm" => llm(rest),
@@ -153,6 +155,8 @@ fn help() {
     println!("  sleep <ticks>     block this shell on the clock, not a spin");
     println!("  ls                list the files on the FAT16 disk");
     println!("  cat <file>        print a file from that disk");
+    println!("  write <file> <..> create or replace a file, for real");
+    println!("  rm <file>         delete one");
     println!("  exec <file>       load an ELF off the disk and run it in ring 3");
     println!("  translate <addr>  walk the page tables for an address");
     println!("  model             what neural network is loaded, if any");
@@ -399,6 +403,37 @@ fn list_files() {
     println!("  {:<14}{:>9}  {}", "name", "size", "first cluster");
     for entry in &entries {
         println!("  {:<14}{:>9}  {}", entry.name, entry.size, entry.first_cluster);
+    }
+}
+
+/// `write notes.txt hello there` -- and it survives a reboot.
+fn write_file(rest: &str) {
+    let rest = rest.trim();
+    let Some((name, text)) = rest.split_once(' ') else {
+        println!("  usage: write <file> <text>");
+        return;
+    };
+    let Some(volume) = volume() else { return };
+
+    match volume.create(name, text.as_bytes()) {
+        Ok(()) => {
+            println!("  wrote {} bytes to {name}", text.len());
+            println!("  reboot and `cat {name}` -- it is on the disk, not in memory.");
+        }
+        Err(error) => println!("  {name}: {error}"),
+    }
+}
+
+fn remove_file(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        println!("  usage: rm <file>");
+        return;
+    }
+    let Some(volume) = volume() else { return };
+    match volume.remove(name) {
+        Ok(()) => println!("  removed {name} (the data is still there; the slot is not)"),
+        Err(error) => println!("  {name}: {error}"),
     }
 }
 

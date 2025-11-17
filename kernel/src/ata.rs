@@ -148,3 +148,67 @@ pub fn present() -> bool {
         status != 0 && status != 0xFF && status & STATUS_READY != 0
     }
 }
+
+/// Write one 16-bit word to a port.
+unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags))
+    };
+}
+
+const COMMAND_WRITE_SECTORS: u8 = 0x30;
+const COMMAND_FLUSH_CACHE: u8 = 0xE7;
+
+/// Write whole sectors starting at logical block `lba`.
+///
+/// The mirror image of `read`, with one addition that is easy to leave out and
+/// impossible to notice in an emulator: the cache flush at the end.
+///
+/// A drive is allowed to report a write complete the moment the bytes reach its
+/// own buffer, and to reorder what it does with them afterwards. Without the
+/// flush, "the file is written" means "the drive has agreed to write it", and a
+/// power cut in between loses data the kernel already promised was safe. QEMU
+/// will never show you this. A real disk will, once.
+pub fn write(lba: u32, buffer: &[u8]) -> Result<(), &'static str> {
+    if buffer.len() % SECTOR_SIZE != 0 {
+        return Err("buffer is not a whole number of sectors");
+    }
+    let count = buffer.len() / SECTOR_SIZE;
+    if count == 0 {
+        return Ok(());
+    }
+    if count > 256 {
+        return Err("too many sectors for one request");
+    }
+
+    unsafe {
+        outb(DRIVE, 0xE0 | (DISK << 4) | ((lba >> 24) & 0x0F) as u8);
+        settle();
+
+        outb(SECTOR_COUNT, if count == 256 { 0 } else { count as u8 });
+        outb(LBA_LOW, lba as u8);
+        outb(LBA_MID, (lba >> 8) as u8);
+        outb(LBA_HIGH, (lba >> 16) as u8);
+        outb(COMMAND, COMMAND_WRITE_SECTORS);
+
+        for sector in 0..count {
+            let status = wait_ready()?;
+            if status & STATUS_DRQ == 0 {
+                return Err("the drive will not accept data");
+            }
+
+            let base = sector * SECTOR_SIZE;
+            for word in 0..SECTOR_SIZE / 2 {
+                let low = buffer[base + word * 2] as u16;
+                let high = buffer[base + word * 2 + 1] as u16;
+                outw(DATA, low | (high << 8));
+            }
+        }
+
+        // Tell the drive to actually commit what it just accepted.
+        outb(COMMAND, COMMAND_FLUSH_CACHE);
+        wait_ready()?;
+    }
+
+    Ok(())
+}

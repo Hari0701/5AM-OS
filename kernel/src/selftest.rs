@@ -232,7 +232,7 @@ fn memory_suite(report: &mut Report) {
         report,
         "translate now fails",
         memory::translate(SCRATCH).is_none(),
-        "still mapped"
+        "the address no longer resolves"
     );
 
     unsafe { memory::allocator().deallocate(frame) };
@@ -400,14 +400,14 @@ fn elf(report: &mut Report) {
         report,
         "rejects a bad magic",
         unsafe { crate::elf::load(&broken, false) }.is_err(),
-        "accepted a non-ELF file"
+        "refused"
     );
 
     check!(
         report,
         "rejects a truncated file",
         unsafe { crate::elf::load(&program[..32], false) }.is_err(),
-        "accepted 32 bytes"
+        "refused 32 bytes"
     );
 }
 
@@ -459,6 +459,74 @@ fn fat(report: &mut Report) {
         report,
         "a missing file is an error",
         volume.find("nope.txt").is_err(),
-        "found a file that is not there"
+        "lookup of a nonexistent name refused"
     );
+
+    // --- writing ---------------------------------------------------------
+    //
+    // Deliberately larger than one cluster, so this exercises a real chain
+    // rather than a single-cluster special case that would pass with the
+    // linking code missing entirely.
+    let mut payload = Vec::new();
+    for index in 0..5000u32 {
+        payload.push((index % 251) as u8);
+    }
+
+    match volume.create("test.dat", &payload) {
+        Ok(()) => {
+            let read_back = volume
+                .find("test.dat")
+                .and_then(|entry| volume.read_file(&entry));
+            match read_back {
+                Ok(data) => {
+                    check!(
+                        report,
+                        "written file reads back",
+                        data == payload,
+                        "{} bytes of {}",
+                        data.len(),
+                        payload.len()
+                    );
+                }
+                Err(error) => check!(report, "written file reads back", false, "{error}"),
+            }
+        }
+        Err(error) => check!(report, "create a file", false, "{error}"),
+    }
+
+    // Replacing must not leak the old chain, or a volume loses space every
+    // time a file is edited.
+    let free_before = free_clusters(&volume);
+    let _ = volume.create("test.dat", &payload);
+    let free_after = free_clusters(&volume);
+    check!(
+        report,
+        "replacing reuses the space",
+        free_before == free_after,
+        "{free_before} free clusters before, {free_after} after"
+    );
+
+    match volume.remove("test.dat") {
+        Ok(()) => {
+            check!(
+                report,
+                "removed file is gone",
+                volume.find("test.dat").is_err(),
+                "no longer in the directory"
+            );
+            check!(
+                report,
+                "delete returns the clusters",
+                free_clusters(&volume) > free_after,
+                "{} free now",
+                free_clusters(&volume)
+            );
+        }
+        Err(error) => check!(report, "remove a file", false, "{error}"),
+    }
+}
+
+/// How much room is left, counted the slow honest way.
+fn free_clusters(volume: &crate::fat::Volume) -> u32 {
+    volume.count_free().unwrap_or(0)
 }

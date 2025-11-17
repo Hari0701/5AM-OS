@@ -1,4 +1,4 @@
-//! FAT16, read-only.
+//! FAT16.
 //!
 //! The last thing this kernel was missing. Until now a program had to be
 //! compiled into the kernel to exist at all — `include_bytes!` is not a
@@ -29,12 +29,20 @@
 //! start, because nothing indexes it. And if the table is damaged, the data is
 //! all still there, in an order nothing records.
 //!
+//! ## Writing
+//!
+//! Reading a filesystem is following instructions somebody else wrote. Writing
+//! one is taking responsibility for a structure that must stay consistent
+//! whatever happens next — and that difference is most of what a filesystem is.
+//!
+//! See the `writing` section below for the ordering rules.
+//!
 //! ## What is deliberately missing
 //!
-//! Writing, subdirectories, and long file names. This reads the root directory
-//! only, in 8.3 form. Long names are stored as a chain of hidden entries
-//! masquerading as volume labels, which is a fascinating piece of backwards
-//! compatibility and not one worth implementing to read `hello.elf`.
+//! Subdirectories and long file names. This uses the root directory only, in
+//! 8.3 form. Long names are stored as a chain of hidden entries masquerading as
+//! volume labels, which is a fascinating piece of backwards compatibility and
+//! not one worth implementing to read `hello.elf`.
 
 use crate::ata::{self, SECTOR_SIZE};
 use alloc::string::String;
@@ -54,6 +62,7 @@ const END_OF_CHAIN: u16 = 0xFFF8;
 #[derive(Clone, Copy)]
 pub struct Volume {
     pub bytes_per_sector: u32,
+    pub fat_count: u32,
     pub sectors_per_cluster: u32,
     pub fat_start: u32,
     pub sectors_per_fat: u32,
@@ -137,6 +146,7 @@ pub fn mount() -> Result<Volume, &'static str> {
 
     Ok(Volume {
         bytes_per_sector,
+        fat_count,
         sectors_per_cluster,
         fat_start,
         sectors_per_fat,
@@ -279,4 +289,256 @@ fn decode_name(slot: &[u8]) -> String {
         name.push_str(&extension);
     }
     name
+}
+
+// --- writing -------------------------------------------------------------
+//
+// Reading a filesystem is following instructions somebody else wrote. Writing
+// one is taking responsibility for a structure that has to stay consistent
+// whatever happens next, and that difference is most of what a filesystem *is*.
+//
+// Three things have to agree after every write: the directory entry (this file
+// exists, is this long, and starts here), the FAT (these clusters belong to it,
+// in this order, ending here), and the data itself. Update them in the wrong
+// order and a power cut leaves a volume that is not merely missing a file but
+// actively wrong -- clusters marked in use by nothing, or two files claiming
+// the same one.
+//
+// The order used here is deliberate: data first, then the table, then the
+// directory entry last. Every prefix of that sequence leaves a volume that is
+// still consistent, just without the new file in it. That is the cheap version
+// of what journalling buys properly.
+
+impl Volume {
+    fn fat_entry_location(&self, cluster: u16) -> (u32, usize) {
+        let offset = cluster as u32 * 2;
+        (
+            self.fat_start + offset / self.bytes_per_sector,
+            (offset % self.bytes_per_sector) as usize,
+        )
+    }
+
+    /// Point `cluster` at `value` in **every** copy of the table.
+    ///
+    /// Both copies, because a volume whose FATs disagree is one that other
+    /// systems will refuse to mount or, worse, quietly repair by picking one.
+    fn set_fat_entry(&self, cluster: u16, value: u16) -> Result<(), &'static str> {
+        let (sector, within) = self.fat_entry_location(cluster);
+        let mut buffer = [0u8; SECTOR_SIZE];
+
+        for copy in 0..self.fat_count {
+            let target = sector + copy * self.sectors_per_fat;
+            ata::read(target, &mut buffer)?;
+            buffer[within..within + 2].copy_from_slice(&value.to_le_bytes());
+            ata::write(target, &buffer)?;
+        }
+        Ok(())
+    }
+
+    /// Find a cluster nobody is using.
+    ///
+    /// A linear scan from the beginning, which is exactly what makes filling a
+    /// nearly full volume slow -- real drivers remember where they last looked.
+    fn find_free_cluster(&self, after: u16) -> Result<u16, &'static str> {
+        for cluster in after.max(2)..(self.clusters as u16 + 2) {
+            if self.next_cluster(cluster)? == 0 {
+                return Ok(cluster);
+            }
+        }
+        Err("the volume is full")
+    }
+
+    fn cluster_bytes_public(&self) -> usize {
+        (self.sectors_per_cluster * self.bytes_per_sector) as usize
+    }
+
+    /// Write `data` into a chain of clusters and return the first one.
+    fn write_chain(&self, data: &[u8]) -> Result<u16, &'static str> {
+        let cluster_bytes = self.cluster_bytes_public();
+        let needed = data.len().div_ceil(cluster_bytes).max(1);
+
+        // Reserve the whole chain before writing anything. Allocating as we go
+        // would leave half a file's clusters marked in use with nothing
+        // pointing at them if we ran out partway.
+        let mut chain = Vec::with_capacity(needed);
+        let mut search_from = 2u16;
+        for _ in 0..needed {
+            let cluster = self.find_free_cluster(search_from)?;
+            // Claim it immediately, or the next search finds the same one.
+            self.set_fat_entry(cluster, 0xFFFF)?;
+            search_from = cluster + 1;
+            chain.push(cluster);
+        }
+
+        // Data first: a cluster with the right bytes and no chain pointing at
+        // it is invisible, which is a safe thing to be.
+        let mut buffer = vec![0u8; cluster_bytes];
+        for (index, &cluster) in chain.iter().enumerate() {
+            let start = index * cluster_bytes;
+            let end = (start + cluster_bytes).min(data.len());
+            buffer.fill(0);
+            if start < data.len() {
+                buffer[..end - start].copy_from_slice(&data[start..end]);
+            }
+            ata::write(self.cluster_to_sector(cluster), &buffer)?;
+        }
+
+        // Then link them, last to first, so a partial chain is never reachable
+        // from the head.
+        for index in (0..chain.len()).rev() {
+            let value = if index + 1 == chain.len() {
+                0xFFFF
+            } else {
+                chain[index + 1]
+            };
+            self.set_fat_entry(chain[index], value)?;
+        }
+
+        Ok(chain[0])
+    }
+
+    /// How many clusters are unused. A full scan of the table, which is what
+    /// `df` is doing when it takes a moment on a very large volume.
+    pub fn count_free(&self) -> Result<u32, &'static str> {
+        let mut free = 0;
+        for cluster in 2..(self.clusters as u16 + 2) {
+            if self.next_cluster(cluster)? == 0 {
+                free += 1;
+            }
+        }
+        Ok(free)
+    }
+
+    fn free_chain(&self, first: u16) -> Result<(), &'static str> {
+        let mut cluster = first;
+        let mut visited = 0u32;
+        while cluster >= 2 && cluster < END_OF_CHAIN {
+            if visited > self.clusters {
+                return Err("cluster chain loops");
+            }
+            visited += 1;
+            let next = self.next_cluster(cluster)?;
+            self.set_fat_entry(cluster, 0)?;
+            cluster = next;
+        }
+        Ok(())
+    }
+
+    /// Find a directory slot for `name`, reusing its own if it already exists.
+    fn directory_slot(&self, name: &str) -> Result<(u32, usize, Option<Entry>), &'static str> {
+        let root_sectors =
+            (self.root_entries * DIRECTORY_ENTRY_SIZE as u32).div_ceil(self.bytes_per_sector);
+        let mut buffer = [0u8; SECTOR_SIZE];
+        let mut first_empty: Option<(u32, usize)> = None;
+
+        for index in 0..root_sectors {
+            let sector = self.root_start + index;
+            ata::read(sector, &mut buffer)?;
+
+            for (slot_index, slot) in buffer.chunks_exact(DIRECTORY_ENTRY_SIZE).enumerate() {
+                let offset = slot_index * DIRECTORY_ENTRY_SIZE;
+                match slot[0] {
+                    ENTRY_FREE | ENTRY_DELETED => {
+                        if first_empty.is_none() {
+                            first_empty = Some((sector, offset));
+                        }
+                        if slot[0] == ENTRY_FREE {
+                            // Nothing beyond here has ever been used.
+                            let (s, o) = first_empty.unwrap();
+                            return Ok((s, o, None));
+                        }
+                    }
+                    _ => {
+                        if slot[11] & (ATTRIBUTE_VOLUME_LABEL | ATTRIBUTE_DIRECTORY) != 0 {
+                            continue;
+                        }
+                        if decode_name(slot).eq_ignore_ascii_case(name) {
+                            return Ok((
+                                sector,
+                                offset,
+                                Some(Entry {
+                                    name: decode_name(slot),
+                                    first_cluster: read_u16(slot, 26),
+                                    size: read_u32(slot, 28),
+                                }),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        match first_empty {
+            Some((sector, offset)) => Ok((sector, offset, None)),
+            None => Err("the root directory is full"),
+        }
+    }
+
+    /// Create or replace a file.
+    pub fn create(&self, name: &str, data: &[u8]) -> Result<(), &'static str> {
+        let (stem, extension) = match name.rsplit_once('.') {
+            Some((stem, extension)) => (stem, extension),
+            None => (name, ""),
+        };
+        if stem.is_empty() || stem.len() > 8 || extension.len() > 3 {
+            return Err("name must fit 8.3");
+        }
+
+        let (sector, offset, existing) = self.directory_slot(name)?;
+
+        // Write the new contents before touching anything that refers to the
+        // old ones.
+        let first_cluster = if data.is_empty() {
+            0
+        } else {
+            self.write_chain(data)?
+        };
+
+        // Only now is the old chain unreachable and safe to release.
+        if let Some(old) = &existing {
+            if old.first_cluster >= 2 {
+                self.free_chain(old.first_cluster)?;
+            }
+        }
+
+        let mut buffer = [0u8; SECTOR_SIZE];
+        ata::read(sector, &mut buffer)?;
+        let slot = &mut buffer[offset..offset + DIRECTORY_ENTRY_SIZE];
+        slot.fill(0);
+        slot[0..11].fill(b' ');
+        for (index, byte) in stem.bytes().enumerate() {
+            slot[index] = byte.to_ascii_uppercase();
+        }
+        for (index, byte) in extension.bytes().enumerate() {
+            slot[8 + index] = byte.to_ascii_uppercase();
+        }
+        slot[11] = 0x20; // an ordinary archive file
+        slot[26..28].copy_from_slice(&first_cluster.to_le_bytes());
+        slot[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        ata::write(sector, &buffer)?;
+
+        Ok(())
+    }
+
+    /// Delete a file: release its clusters and mark the directory slot dead.
+    ///
+    /// `0xE5` in the first byte, which famously does not erase the data -- it
+    /// only says the slot may be reused. Every undelete tool ever written is
+    /// built on that, and so is every disposal mistake.
+    pub fn remove(&self, name: &str) -> Result<(), &'static str> {
+        let (sector, offset, existing) = self.directory_slot(name)?;
+        let Some(entry) = existing else {
+            return Err("no such file");
+        };
+
+        let mut buffer = [0u8; SECTOR_SIZE];
+        ata::read(sector, &mut buffer)?;
+        buffer[offset] = ENTRY_DELETED;
+        ata::write(sector, &buffer)?;
+
+        if entry.first_cluster >= 2 {
+            self.free_chain(entry.first_cluster)?;
+        }
+        Ok(())
+    }
 }
