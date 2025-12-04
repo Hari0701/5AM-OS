@@ -103,6 +103,7 @@ fn execute(command: &str) {
         "rm" => remove_file(rest),
         "exec" => exec(rest),
         "translate" => translate(rest),
+        "pagemap" => pagemap(),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
         "fault" => fault(rest),
@@ -150,7 +151,7 @@ fn help() {
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
     println!("  selftest [suite]  run the kernel's tests against itself");
-    println!("                    suites: heap memory sync sched priority elf fat");
+    println!("                    suites: heap memory space sync sched priority elf fat");
     println!("  workers           three tasks share one semaphore, visibly");
     println!("  sleep <ticks>     block this shell on the clock, not a spin");
     println!("  ls                list the files on the FAT16 disk");
@@ -159,6 +160,7 @@ fn help() {
     println!("  rm <file>         delete one");
     println!("  exec <file>       load an ELF off the disk and run it in ring 3");
     println!("  translate <addr>  walk the page tables for an address");
+    println!("  pagemap           which 512 GiB slots of the address space exist");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
     println!("                    NOT know anything about this kernel.");
@@ -507,6 +509,36 @@ fn user_mode() {
     println!("  does not.");
     println!();
     crate::user::run();
+    println!();
+}
+
+/// The whole address space, one line per occupied 512 GiB slot.
+///
+/// Every virtual address on this machine falls into one of 512 top-level slots.
+/// Almost all of them are empty -- an address space is mostly a hole, and the
+/// holes are what make a 64-bit address space affordable.
+fn pagemap() {
+    println!();
+    println!("  The level-4 table: 512 slots, each covering 512 GiB.");
+    println!();
+    println!("  slot  covers                 entry");
+    let mut present = 0;
+    for (index, entry, base) in crate::memory::top_level_map() {
+        if entry & 1 == 0 {
+            continue;
+        }
+        present += 1;
+        let what = match index {
+            0 => "user programs live here",
+            _ if base >= 0x1000_0000_0000 && base < 0x1100_0000_0000 => "the kernel image",
+            _ => "kernel data",
+        };
+        println!("  {index:<5} {base:#018x}   {entry:#018x}  {what}");
+    }
+    println!();
+    println!("  {present} of 512 slots in use. The rest is not merely unused,");
+    println!("  it is unmapped -- no table exists for it at all, which is how a");
+    println!("  128 TiB address space costs a few kilobytes.");
     println!();
 }
 

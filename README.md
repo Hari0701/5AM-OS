@@ -133,6 +133,9 @@ ARM Mac is emulating x86 instruction by instruction.
 | No-execute pages | working | A permission the CPU ignores until you ask it not to |
 | Blocked tasks, sleep | working | A scheduler you can tell "not this one, not yet" |
 | Self-tests | working | The only honest place to test a kernel is on the machine |
+| Priorities + aging | working | Starvation ruled out with a bound, not hoped away |
+| FAT16 writes | working | Consistency is an ordering problem, not a coding one |
+| Address spaces | working | A process is a task with its own level-4 table |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -947,22 +950,18 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
-- **No priorities.** The scheduler is plain round robin over the runnable
-  tasks. A priority scheme with aging was written and deleted: it starved two of
-  three workers, and a scheduler whose fairness cannot be demonstrated is worse
-  than an obvious one that can.
-- **One address space.** Every task shares one CR3. Ring 3 is fenced off by the
-  user bit, not by isolation, so two user programs would see each other's
-  memory. "Task" is honest here; "process" would not be.
+- **Kernel tasks still share one address space.** A ring 3 program gets its own
+  level-4 table, so it cannot see any other program's memory. Kernel tasks are
+  still threads in one space, and there is no `fork` — a process here is
+  something `exec` creates and destroys, not something that reproduces.
 - **`static mut` is still the idiom** for most kernel state, reached through
   `addr_of_mut!`. Sound today because one core, and protected where it is
   shared; the right long-term answer is `UnsafeCell` behind the locks that now
   exist.
-- **The filesystem is read-only.** Nothing writes to the disk. Writing means
-  allocating clusters and updating both copies of the table without leaving the
-  volume inconsistent if the power goes out halfway, which is most of what a
-  real filesystem is.
 - **Root directory only.** No subdirectories, no long file names, 8.3 only.
+- **No journal.** Writes are ordered so that every prefix leaves a consistent
+  volume, which is the cheap version of the guarantee; a torn write in the
+  middle of a sector is still a torn write.
 - **No relocation.** Only `ET_EXEC` at a fixed address. Position-independent
   executables are refused rather than half-supported, because running one means
   choosing a base and applying relocations.

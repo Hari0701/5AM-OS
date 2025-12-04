@@ -176,8 +176,25 @@ fn indexes(address: u64) -> [usize; 4] {
 /// Editing live page tables. A wrong entry here does not fault — it silently
 /// points at someone else's memory.
 pub unsafe fn map_page(virtual_address: u64, frame: u64, flags: u64) -> Result<(), &'static str> {
+    unsafe { map_page_in(read_cr3(), virtual_address, frame, flags) }
+}
+
+/// As `map_page`, but into a page table tree that is not the active one.
+///
+/// This is what an address space *is*, mechanically: the same walk, rooted
+/// somewhere else. Everything about mapping is unchanged -- only the first
+/// table read differs.
+///
+/// # Safety
+/// As `map_page`, and `root` must be a valid level-4 table.
+pub unsafe fn map_page_in(
+    root: u64,
+    virtual_address: u64,
+    frame: u64,
+    flags: u64,
+) -> Result<(), &'static str> {
     let indexes = indexes(virtual_address);
-    let mut table = read_cr3();
+    let mut table = root;
 
     // The user bit is checked at *every* level, and the CPU takes the strictest
     // answer it finds. Setting it only on the final entry is the classic way to
@@ -233,8 +250,13 @@ pub unsafe fn map_page(virtual_address: u64, frame: u64, flags: u64) -> Result<(
 /// Used by `translate` in the shell — being able to *see* the walk is most of
 /// the point of implementing it.
 pub fn translate(virtual_address: u64) -> Option<(u64, [u64; 4])> {
+    translate_in(read_cr3(), virtual_address)
+}
+
+/// As `translate`, rooted at a table you name.
+pub fn translate_in(root: u64, virtual_address: u64) -> Option<(u64, [u64; 4])> {
     let indexes = indexes(virtual_address);
-    let mut table = read_cr3();
+    let mut table = root;
     let mut entries = [0u64; 4];
 
     for level in 0..4 {
@@ -353,6 +375,23 @@ pub unsafe fn release(pages: &[u64]) -> usize {
         }
     }
     freed
+}
+
+/// Which top-level slots are in use, and what address range each one covers.
+///
+/// The level-4 table has 512 entries and each one owns 512 GiB of address
+/// space. Printing which are present is the clearest picture of the address
+/// space a kernel can give you -- and it is the measurement that decides
+/// whether per-process address spaces are cheap or hard, because a slot the
+/// kernel and userspace both need cannot simply be swapped per process.
+pub fn top_level_map() -> [(usize, u64, u64); 512] {
+    let mut out = [(0usize, 0u64, 0u64); 512];
+    let table = read_cr3();
+    for index in 0..512 {
+        let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(index) };
+        out[index] = (index, entry, (index as u64) << 39);
+    }
+    out
 }
 
 pub const FLAG_WRITABLE: u64 = WRITABLE;
@@ -492,4 +531,155 @@ pub fn no_execute_active() -> bool {
 /// Call once, from `enable_no_execute`'s caller, with the value it returned.
 pub unsafe fn set_no_execute_active(active: bool) {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(NO_EXECUTE_ACTIVE), active) };
+}
+
+// --- address spaces ------------------------------------------------------
+
+/// Where userspace ends. Everything below this is per-process; everything
+/// above belongs to the kernel and is shared by every address space.
+pub const USER_SPACE_END: u64 = 1 << 39;
+
+/// A private view of memory.
+///
+/// Up to now every task shared one set of page tables, so "ring 3" fenced a
+/// program off from the *kernel* and not from other programs. Two user programs
+/// could read each other's memory completely. That is the difference between a
+/// task and a process, and this is the whole of it: a different level-4 table.
+///
+/// ## What has to be shared anyway
+///
+/// The kernel must stay mapped in every address space, at the same addresses.
+/// An interrupt can arrive at any moment, and the handler is kernel code that
+/// runs on whatever address space happened to be active — if the kernel were
+/// not mapped there, the first timer tick after a switch would be a triple
+/// fault with nothing printed.
+///
+/// On this machine that is easy, and `pagemap` is how I checked rather than
+/// assumed: the kernel occupies top-level slots 2 through 7 and 136, and
+/// userspace lives entirely in slot 0. Copying every slot except 0 gives a
+/// process a private lower half and a shared kernel, which is the same
+/// arrangement Linux uses — for the same reason, and at the same granularity.
+pub struct AddressSpace {
+    root: u64,
+}
+
+impl AddressSpace {
+    /// Build a new address space: empty user half, kernel half shared.
+    pub fn new() -> Option<Self> {
+        let root = allocator().allocate()?;
+        unsafe {
+            core::ptr::write_bytes(physical_to_virtual(root) as *mut u8, 0, PAGE_SIZE);
+
+            // Share every kernel slot by copying the *entry*, not the table.
+            // Both address spaces then point at the same lower tables, so a
+            // change the kernel makes to its own mappings is visible in every
+            // process without any synchronisation at all.
+            let current = physical_to_virtual(read_cr3()) as *const u64;
+            let new = physical_to_virtual(root) as *mut u64;
+            for slot in 1..512 {
+                *new.add(slot) = *current.add(slot);
+            }
+        }
+        Some(Self { root })
+    }
+
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    /// Make this the address space the CPU is using.
+    ///
+    /// # Safety
+    /// Every address the current code depends on must be mapped here too --
+    /// which for kernel code it is, by construction. Writing CR3 also flushes
+    /// the entire TLB, which is why switching processes is not free.
+    pub unsafe fn activate(&self) {
+        unsafe { asm!("mov cr3, {}", in(reg) self.root, options(nostack, preserves_flags)) };
+    }
+
+    /// Map a page into this space rather than the live one.
+    ///
+    /// # Safety
+    /// As `map_page`.
+    pub unsafe fn map(&self, virtual_address: u64, frame: u64, flags: u64) -> Result<(), &'static str> {
+        if virtual_address >= USER_SPACE_END {
+            return Err("that address belongs to the kernel");
+        }
+        unsafe { map_page_in(self.root, virtual_address, frame, flags) }
+    }
+
+    pub fn translate(&self, virtual_address: u64) -> Option<(u64, [u64; 4])> {
+        translate_in(self.root, virtual_address)
+    }
+
+    /// Tear the user half down and return every frame, including the tables.
+    ///
+    /// Only slot 0 is walked. Touching any other slot would free memory the
+    /// kernel and every other process are still using -- the shared entries are
+    /// copies, and freeing what they point at is exactly the bug that makes
+    /// sharing dangerous.
+    ///
+    /// # Safety
+    /// This space must not be active, and nothing may still be using it.
+    pub unsafe fn destroy(self) -> usize {
+        let mut freed = 0;
+        unsafe {
+            let root_table = physical_to_virtual(self.root) as *mut u64;
+            let slot0 = *root_table;
+            if slot0 & PRESENT != 0 {
+                freed += free_subtree(slot0 & ADDRESS_MASK, 3);
+                *root_table = 0;
+            }
+            allocator().deallocate(self.root);
+        }
+        freed + 1
+    }
+}
+
+/// Free a table and everything under it.
+///
+/// `level` is the level of *this* table: 3 for a PDPT, 2 for a page directory,
+/// 1 for a page table. Only a level-1 table's entries name data frames;
+/// everything above names another table.
+///
+/// Getting that off by one is not a subtle failure. The first version recursed
+/// one level too far, treated 4 KiB of user data as 512 page table entries, and
+/// handed the resulting nonsense to the frame allocator -- which faulted trying
+/// to write a free-list pointer to a non-canonical address. The oracle called
+/// it correctly and the disassembly named the store, but the mistake was three
+/// frames up the stack from where it landed.
+///
+/// # Safety
+/// Nothing may reference any of it.
+unsafe fn free_subtree(table: u64, level: usize) -> usize {
+    let mut freed = 0;
+    let base = physical_to_virtual(table) as *mut u64;
+    for index in 0..512 {
+        let entry = unsafe { *base.add(index) };
+        if entry & PRESENT == 0 {
+            continue;
+        }
+        // A huge page names data directly even above level 1.
+        let huge = level > 1 && entry & (1 << 7) != 0;
+        if level == 1 || huge {
+            unsafe { allocator().deallocate(entry & ADDRESS_MASK) };
+            freed += 1;
+        } else {
+            freed += unsafe { free_subtree(entry & ADDRESS_MASK, level - 1) };
+        }
+    }
+    unsafe { allocator().deallocate(table) };
+    freed + 1
+}
+
+/// The address space the CPU is using right now.
+pub fn active_root() -> u64 {
+    read_cr3()
+}
+
+/// # Safety
+/// `root` must be a level-4 table in which the currently executing code is
+/// mapped.
+pub unsafe fn activate_root(root: u64) {
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }

@@ -44,12 +44,28 @@ pub fn run() {
 /// `load()` takes a byte slice and does not care where it came from, which is
 /// the whole reason `exec` needed nothing new from this module.
 pub fn run_bytes(program: &[u8]) {
+    // A private address space, so this program cannot see any other one's
+    // memory -- which until now it could, because every task shared a single
+    // set of page tables and ring 3 only fenced userspace off from the kernel.
+    let Some(space) = memory::AddressSpace::new() else {
+        println!("  out of physical memory for an address space");
+        return;
+    };
+    let kernel_root = memory::active_root();
+
+    // Switch before loading, so every mapping below lands in the new space and
+    // the copies go to the right place. Safe because the kernel is mapped
+    // identically in both -- see AddressSpace for why that is not optional.
+    unsafe { space.activate() };
+    println!("  Private address space at {:#x}.", space.root());
     println!("  Reading its program headers:");
 
     let mut loaded = match unsafe { elf::load(program, true) } {
         Ok(loaded) => loaded,
         Err(error) => {
             println!("  refusing to run it: {error}");
+            unsafe { memory::activate_root(kernel_root) };
+            unsafe { space.destroy() };
             return;
         }
     };
@@ -68,11 +84,15 @@ pub fn run_bytes(program: &[u8]) {
         }
         let Some(frame) = memory::allocator().allocate() else {
             println!("  out of physical memory for the user stack");
+            unsafe { memory::activate_root(kernel_root) };
+            unsafe { space.destroy() };
             return;
         };
         let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
         if let Err(error) = unsafe { memory::map_page(address, frame, flags) } {
             println!("  could not map the user stack: {error}");
+            unsafe { memory::activate_root(kernel_root) };
+            unsafe { space.destroy() };
             return;
         }
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE) };
@@ -96,15 +116,17 @@ pub fn run_bytes(program: &[u8]) {
         syscall::enter_ring3(loaded.entry, stack_top - 8);
     }
 
-    // The program is over, so its address space is rubbish. Hand every frame
-    // back: without this, each `exec` costs the machine a few pages forever,
-    // and running one in a loop eventually exhausts physical memory with no
-    // sign of what took it.
-    let freed = unsafe { memory::release(&loaded.pages) };
+    // The program is over, so its address space is rubbish. Switch back to the
+    // kernel's own before tearing it down -- destroying the tables the CPU is
+    // currently translating through would not survive the next instruction.
+    unsafe { memory::activate_root(kernel_root) };
+    let freed = unsafe { space.destroy() };
+    let _ = &loaded.pages;
 
     println!();
     println!("  Back in ring 0, by way of {} syscalls.", syscall::count() - before);
-    println!("  {freed} pages unmapped and returned to the frame allocator.");
+    println!("  Address space destroyed: {freed} frames returned, tables included.");
+    println!("  Nothing of that program is mapped anywhere any more.");
     println!("  Nothing in that program was compiled with this kernel. The only");
     println!("  thing they share is the number in `int 0x80`.");
 }

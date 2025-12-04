@@ -76,6 +76,10 @@ pub fn run(which: &str) {
         println!("  memory");
         memory_suite(&mut report);
     }
+    if all || which == "space" {
+        println!("  address space");
+        address_space(&mut report);
+    }
     if all || which == "sync" {
         println!("  sync");
         sync(&mut report);
@@ -242,6 +246,81 @@ fn memory_suite(report: &mut Report) {
         "no frames leaked",
         free_after == free_before,
         "{free_before} before, {free_after} after"
+    );
+}
+
+/// Does a private address space actually hide anything?
+///
+/// Map a page in a new space, then check the kernel's own space cannot see it,
+/// and that the kernel's mappings are still reachable from inside the new one.
+/// Those two together are the whole claim: private below, shared above.
+fn address_space(report: &mut Report) {
+    let (free_before, _) = memory::allocator().stats();
+
+    let Some(space) = memory::AddressSpace::new() else {
+        check!(report, "create an address space", false, "out of memory");
+        return;
+    };
+    check!(
+        report,
+        "create an address space",
+        space.root() != memory::active_root(),
+        "root {:#x}, kernel {:#x}",
+        space.root(),
+        memory::active_root()
+    );
+
+    const PRIVATE: u64 = 0x0000_0040_0000;
+    let Some(frame) = memory::allocator().allocate() else {
+        check!(report, "allocate a frame", false, "out of memory");
+        return;
+    };
+    let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
+    let mapped = unsafe { space.map(PRIVATE, frame, flags) };
+    check!(report, "map into the new space", mapped.is_ok(), "{mapped:?}");
+
+    check!(
+        report,
+        "the new space sees it",
+        space.translate(PRIVATE).map(|(p, _)| p) == Some(frame),
+        "{:?}",
+        space.translate(PRIVATE).map(|(p, _)| p)
+    );
+
+    // The point of the whole exercise.
+    check!(
+        report,
+        "the kernel space does not",
+        memory::translate(PRIVATE).is_none(),
+        "the private mapping leaked into the active space"
+    );
+
+    // And the kernel must still be reachable from inside it, or the first
+    // interrupt after a switch is a triple fault.
+    let kernel_address = memory::active_root;
+    let probe = kernel_address as usize as u64;
+    check!(
+        report,
+        "the kernel is mapped there too",
+        space.translate(probe).is_some(),
+        "kernel code at {probe:#x} unreachable from the new space"
+    );
+
+    // A space refuses to map anything above the user boundary.
+    check!(
+        report,
+        "refuses a kernel address",
+        unsafe { space.map(memory::USER_SPACE_END, frame, flags) }.is_err(),
+        "accepted a kernel-half mapping"
+    );
+
+    let freed = unsafe { space.destroy() };
+    let (free_after, _) = memory::allocator().stats();
+    check!(
+        report,
+        "destroy returns everything",
+        free_after == free_before,
+        "{freed} frames freed, {free_before} -> {free_after}"
     );
 }
 
