@@ -80,6 +80,10 @@ pub fn run(which: &str) {
         println!("  address space");
         address_space(&mut report);
     }
+    if all || which == "cow" {
+        println!("  copy on write");
+        cow(&mut report);
+    }
     if all || which == "sync" {
         println!("  sync");
         sync(&mut report);
@@ -321,6 +325,82 @@ fn address_space(report: &mut Report) {
         "destroy returns everything",
         free_after == free_before,
         "{freed} frames freed, {free_before} -> {free_after}"
+    );
+}
+
+/// Does fork share pages, and does the first write really un-share them?
+fn cow(report: &mut Report) {
+    let (free_before, _) = memory::allocator().stats();
+    let Some(parent) = memory::AddressSpace::new() else {
+        check!(report, "create a parent space", false, "out of memory");
+        return;
+    };
+
+    const PAGE: u64 = 0x0000_0080_0000;
+    let Some(frame) = memory::allocator().allocate() else {
+        return;
+    };
+    let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
+    if unsafe { parent.map(PAGE, frame, flags) }.is_err() {
+        check!(report, "map a writable page", false, "map failed");
+        return;
+    }
+
+    let Some(child) = (unsafe { parent.fork() }) else {
+        check!(report, "fork the space", false, "out of memory");
+        return;
+    };
+
+    // Nothing is copied yet: both must name the same physical frame.
+    let parent_frame = parent.translate(PAGE).map(|(p, _)| p);
+    let child_frame = child.translate(PAGE).map(|(p, _)| p);
+    check!(
+        report,
+        "fork copies no data",
+        parent_frame == Some(frame) && child_frame == Some(frame),
+        "both at {frame:#x}"
+    );
+
+    check!(
+        report,
+        "the frame is marked shared",
+        memory::is_shared(frame),
+        "refcount did not rise"
+    );
+
+    // Writing has to go through the fault handler, which needs the space to be
+    // active. Switch, write, switch back.
+    let kernel_root = memory::active_root();
+    unsafe {
+        parent.activate();
+        core::ptr::write_volatile(PAGE as *mut u64, 0xC0FFEE);
+        memory::activate_root(kernel_root);
+    }
+
+    let after = parent.translate(PAGE).map(|(p, _)| p);
+    check!(
+        report,
+        "writing gives a private copy",
+        after.is_some() && after != Some(frame),
+        "parent moved from {frame:#x} to {after:?}"
+    );
+    check!(
+        report,
+        "the other side keeps the original",
+        child.translate(PAGE).map(|(p, _)| p) == Some(frame),
+        "child still at {frame:#x}"
+    );
+
+    unsafe {
+        child.destroy();
+        parent.destroy();
+    }
+    let (free_after, _) = memory::allocator().stats();
+    check!(
+        report,
+        "both spaces free cleanly",
+        free_after == free_before,
+        "{free_before} -> {free_after}"
     );
 }
 

@@ -270,12 +270,35 @@ extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, error: 
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
-    // We are about to stop the machine. Take the console by force rather than
-    // waiting on a lock whose holder may be the code that just faulted.
-    unsafe { crate::serial::force_unlock_console() };
     // CR2 holds the address that could not be translated.
     let address: u64;
     unsafe { asm!("mov {}, cr2", out(reg) address, options(nomem, nostack)) };
+
+    // Not every page fault is an error. This is the one that is routine: a
+    // write to a page that fork made read-only on purpose. Handle it, and
+    // return -- `iretq` re-runs the instruction that faulted, which now
+    // succeeds and never knows anything happened.
+    //
+    // This is the moment paging stops being a lookup table and becomes a
+    // mechanism: the kernel gets control at the exact instant a program
+    // touches memory, and can decide what that memory is.
+    // Note what is *not* checked here: which ring the write came from. The
+    // copy-on-write bit in the page table is the authority, not the privilege
+    // level of whoever touched it -- the kernel writes into a forked process's
+    // memory too, and that write deserves the same private copy. Gating this
+    // on a ring 3 fault was my first version, and it made every kernel-side
+    // write to a shared page fatal instead of routine.
+    const PRESENT: u64 = 1 << 0;
+    const WRITE: u64 = 1 << 1;
+    if error & PRESENT != 0 && error & WRITE != 0 {
+        if unsafe { crate::memory::cow_fault(address) } {
+            return;
+        }
+    }
+
+    // Everything past here is fatal, so take the console by force rather than
+    // waiting on a lock whose holder may be the code that just faulted.
+    unsafe { crate::serial::force_unlock_console() };
 
     println!("\n[trap] PAGE FAULT");
     println!("       tried to touch : {address:#018x}");

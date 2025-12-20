@@ -55,6 +55,7 @@ cargo build --package mkfs --release
 FS="target/fs.img"
 ./target/release/mkfs "$FS" \
   hello.elf=userland/target/x86_64-unknown-none/release/hello \
+  fork.elf=userland/target/x86_64-unknown-none/release/forkdemo \
   readme.txt=disk/readme.txt \
   motd.txt=disk/motd.txt
 

@@ -151,7 +151,7 @@ fn help() {
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
     println!("  selftest [suite]  run the kernel's tests against itself");
-    println!("                    suites: heap memory space sync sched priority elf fat");
+    println!("                    suites: heap memory space cow sync sched priority elf fat");
     println!("  workers           three tasks share one semaphore, visibly");
     println!("  sleep <ticks>     block this shell on the clock, not a spin");
     println!("  ls                list the files on the FAT16 disk");

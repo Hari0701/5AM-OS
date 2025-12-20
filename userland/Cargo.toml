@@ -16,6 +16,10 @@ edition = "2021"
 name = "hello"
 path = "src/main.rs"
 
+[[bin]]
+name = "forkdemo"
+path = "src/forkdemo.rs"
+
 [profile.release]
 panic = "abort"
 # Smaller is better here: every byte gets copied into a user page by hand.

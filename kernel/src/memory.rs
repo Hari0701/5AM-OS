@@ -31,6 +31,7 @@
 //! this file.
 
 use crate::println;
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use core::arch::asm;
 
@@ -583,6 +584,12 @@ impl AddressSpace {
         Some(Self { root })
     }
 
+    /// Wrap a level-4 table this code did not allocate, without taking
+    /// ownership of it. Used to fork the address space that is already active.
+    pub fn adopt(root: u64) -> Self {
+        Self { root }
+    }
+
     pub fn root(&self) -> u64 {
         self.root
     }
@@ -662,7 +669,20 @@ unsafe fn free_subtree(table: u64, level: usize) -> usize {
         // A huge page names data directly even above level 1.
         let huge = level > 1 && entry & (1 << 7) != 0;
         if level == 1 || huge {
-            unsafe { allocator().deallocate(entry & ADDRESS_MASK) };
+            let frame = entry & ADDRESS_MASK;
+            // A shared frame belongs to somebody else too. Dropping our
+            // reference is all we may do -- freeing it would hand a page
+            // another address space is still reading to the next allocation.
+            //
+            // Note the test is "was it shared", not "is it still shared after
+            // dropping". Unsharing down to one owner means the *other* space
+            // now has it exclusively, which is precisely when freeing it here
+            // would be a disaster.
+            if share_count(frame) > 1 {
+                unshare(frame);
+                continue;
+            }
+            unsafe { allocator().deallocate(frame) };
             freed += 1;
         } else {
             freed += unsafe { free_subtree(entry & ADDRESS_MASK, level - 1) };
@@ -682,4 +702,225 @@ pub fn active_root() -> u64 {
 /// mapped.
 pub unsafe fn activate_root(root: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
+// --- copy on write -------------------------------------------------------
+
+/// Bit 9 is one of three bits the CPU ignores entirely and leaves to the OS.
+///
+/// This one means "read-only because it is shared, not because it is meant to
+/// be read-only". Without a distinction like it, the fault handler cannot tell
+/// a page it should silently copy from a page a program has no business writing
+/// to — and would happily make `.text` writable on demand.
+const COW: u64 = 1 << 9;
+
+/// Frames referenced by more than one address space, and by how many.
+///
+/// Only shared frames appear here, which keeps it tiny: a forked program shares
+/// a dozen pages, not a million. A production kernel keeps a counter per frame
+/// in a flat array, because it shares at a very different scale.
+static mut SHARED: Option<Vec<(u64, u32)>> = None;
+
+fn shared() -> &'static mut Vec<(u64, u32)> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(SHARED);
+        slot.get_or_insert_with(Vec::new)
+    }
+}
+
+/// Record one more owner of `frame`.
+fn share(frame: u64) {
+    let table = shared();
+    match table.iter_mut().find(|(f, _)| *f == frame) {
+        // Already shared: one more owner.
+        Some((_, count)) => *count += 1,
+        // First share: two owners, the one that had it and the new one.
+        None => table.push((frame, 2)),
+    }
+}
+
+/// Drop one owner. Returns how many are left.
+fn unshare(frame: u64) -> u32 {
+    let table = shared();
+    if let Some(index) = table.iter().position(|(f, _)| *f == frame) {
+        table[index].1 -= 1;
+        let left = table[index].1;
+        if left <= 1 {
+            table.swap_remove(index);
+        }
+        return left;
+    }
+    1
+}
+
+fn share_count(frame: u64) -> u32 {
+    shared()
+        .iter()
+        .find(|(f, _)| *f == frame)
+        .map(|(_, c)| *c)
+        .unwrap_or(1)
+}
+
+/// Every present page in the user half of `root`, with a pointer to its entry.
+fn user_pages(root: u64) -> Vec<(u64, u64, *mut u64)> {
+    let mut out = Vec::new();
+    let level4 = physical_to_virtual(root) as *mut u64;
+    let slot0 = unsafe { *level4 };
+    if slot0 & PRESENT == 0 {
+        return out;
+    }
+
+    let pdpt = physical_to_virtual(slot0 & ADDRESS_MASK) as *mut u64;
+    for i3 in 0..512 {
+        let e3 = unsafe { *pdpt.add(i3) };
+        if e3 & PRESENT == 0 || e3 & (1 << 7) != 0 {
+            continue;
+        }
+        let directory = physical_to_virtual(e3 & ADDRESS_MASK) as *mut u64;
+        for i2 in 0..512 {
+            let e2 = unsafe { *directory.add(i2) };
+            if e2 & PRESENT == 0 || e2 & (1 << 7) != 0 {
+                continue;
+            }
+            let table = physical_to_virtual(e2 & ADDRESS_MASK) as *mut u64;
+            for i1 in 0..512 {
+                let pointer = unsafe { table.add(i1) };
+                let entry = unsafe { *pointer };
+                if entry & PRESENT == 0 {
+                    continue;
+                }
+                let address = ((i3 as u64) << 30) | ((i2 as u64) << 21) | ((i1 as u64) << 12);
+                out.push((address, entry, pointer));
+            }
+        }
+    }
+    out
+}
+
+impl AddressSpace {
+    /// Duplicate this address space without duplicating its memory.
+    ///
+    /// The obvious implementation copies every page, and the obvious
+    /// implementation is what makes `fork` expensive enough that people avoid
+    /// it. Almost every forked program immediately replaces itself with another
+    /// one, so nearly all of that copying is thrown away unread.
+    ///
+    /// So copy nothing. Point both address spaces at the same frames, take the
+    /// write permission away from **both**, and mark the entries copy-on-write.
+    /// Whoever writes first takes a fault, gets a private copy, and neither
+    /// program can tell the difference. Memory is only spent on pages that are
+    /// actually modified.
+    ///
+    /// The tables themselves *are* copied. Sharing those instead would be
+    /// possible and is what makes a real implementation faster still, but then
+    /// the first write has to un-share a whole table before it can un-share a
+    /// page, and that is a second mechanism to get right.
+    ///
+    /// # Safety
+    /// `self` must be a valid address space; the caller owns the result.
+    pub unsafe fn fork(&self) -> Option<AddressSpace> {
+        let child = AddressSpace::new()?;
+
+        for (address, entry, pointer) in user_pages(self.root) {
+            let frame = entry & ADDRESS_MASK;
+            let flags = entry & !ADDRESS_MASK;
+
+            // A page that was writable becomes read-only and copy-on-write in
+            // both. One that was already read-only stays exactly as it is --
+            // sharing immutable pages needs no mechanism at all, and marking
+            // `.text` copy-on-write would mean silently permitting a write to
+            // it later.
+            let child_flags = if flags & WRITABLE != 0 {
+                let shared_flags = (flags & !WRITABLE) | COW;
+                unsafe {
+                    *pointer = frame | shared_flags;
+                    asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+                }
+                shared_flags
+            } else {
+                flags
+            };
+
+            if unsafe { map_page_in(child.root, address, frame, child_flags & !PRESENT) }.is_err() {
+                return None;
+            }
+            share(frame);
+        }
+
+        Some(child)
+    }
+}
+
+/// Handle a write to a copy-on-write page. Returns false if this fault is not
+/// one of ours, in which case it is a real fault and the caller should say so.
+///
+/// # Safety
+/// Called from the page fault handler with the faulting address from CR2.
+pub unsafe fn cow_fault(address: u64) -> bool {
+    let page = address & !(PAGE_SIZE as u64 - 1);
+    if page >= USER_SPACE_END {
+        return false;
+    }
+
+    let root = read_cr3();
+    let indexes = indexes(page);
+    let mut table = root;
+    for level in 0..3 {
+        let entry = unsafe { *(physical_to_virtual(table) as *const u64).add(indexes[level]) };
+        if entry & PRESENT == 0 || entry & (1 << 7) != 0 {
+            return false;
+        }
+        table = entry & ADDRESS_MASK;
+    }
+    let pointer = (physical_to_virtual(table) as *mut u64).add(indexes[3]);
+    let entry = unsafe { *pointer };
+
+    // Only a page we marked. A read-only page without the COW bit is one the
+    // program genuinely may not write, and turning this into "make it writable"
+    // would quietly grant that.
+    if entry & PRESENT == 0 || entry & COW == 0 || entry & WRITABLE != 0 {
+        return false;
+    }
+
+    let frame = entry & ADDRESS_MASK;
+
+    // Ask how many owners there are *before* dropping ours. Decrementing first
+    // and then testing was my first version, and it gets the two-owner case --
+    // the only case fork ever produces -- exactly backwards: two owners minus
+    // one reads as "sole owner", so the faulting process keeps the shared page
+    // and simply grants itself write access to memory the other one is still
+    // using. Both then free it, which is a double free on top of the sharing
+    // bug. It passes every test that does not compare physical frames.
+    let owners = share_count(frame);
+
+    if owners > 1 {
+        // Somebody else still has it: take a private copy and stop being an
+        // owner of the original.
+        unshare(frame);
+        let Some(fresh) = allocator().allocate() else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                physical_to_virtual(frame) as *const u8,
+                physical_to_virtual(fresh) as *mut u8,
+                PAGE_SIZE,
+            );
+            *pointer = fresh | ((entry & !ADDRESS_MASK) | WRITABLE) & !COW;
+        }
+    } else {
+        // Last owner. There is nothing to copy -- the page is already private,
+        // it was only being kept read-only in case somebody else needed it.
+        // Real kernels get this wrong and copy anyway, which is a page of
+        // memory and a memcpy spent proving something to nobody.
+        unsafe { *pointer = (entry | WRITABLE) & !COW };
+    }
+
+    unsafe { asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags)) };
+    true
+}
+
+/// Is this frame shared with another address space?
+pub fn is_shared(frame: u64) -> bool {
+    share_count(frame) > 1
 }

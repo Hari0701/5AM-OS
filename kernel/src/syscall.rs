@@ -53,6 +53,7 @@ pub const SYSCALL_VECTOR: u8 = 0x80;
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_REPORT_CS: u64 = 2;
+pub const SYS_FORK: u64 = 3;
 
 /// Kernel RSP at the moment we dropped to ring 3, so `exit` can get back.
 static mut KERNEL_RSP: u64 = 0;
@@ -68,15 +69,31 @@ pub fn count() -> u64 {
 ///
 /// Ordinary Rust, running in ring 0, with the user's arguments in registers.
 /// The returned value ends up in the user's RAX.
-extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64) -> u64 {
+extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, context: *mut u64) -> u64 {
     unsafe { COUNT += 1 };
 
     match number {
         SYS_EXIT => {
             println!("  [syscall] exit({arg0}) -- leaving ring 3");
+
+            // If a forked child is waiting, run it now rather than returning
+            // to the kernel. Userspace is not preemptible yet, so the two
+            // processes cannot run at the same time -- but they are genuinely
+            // two processes, with separate address spaces, and this is where
+            // the second one gets its turn.
+            if let Some(child) = take_pending_child() {
+                println!("  [syscall] switching to the forked child");
+                unsafe {
+                    crate::memory::activate_root(child.root);
+                    resume_user(core::ptr::addr_of!(child.context) as *const u64)
+                }
+            }
+
             // Never returns: unwinds all the way out of enter_ring3.
             unsafe { return_to_kernel() }
         }
+
+        SYS_FORK => fork(context),
 
         SYS_WRITE => {
             // The one check that makes this a kernel rather than a library.
@@ -149,6 +166,10 @@ pub unsafe extern "C" fn syscall_entry() {
 
         // The user's calling convention -- number in rax, args in rdi and rsi --
         // shifted into the one Rust expects.
+        // Fourth argument: where the saved context starts, which is exactly
+        // where RSP points now. `fork` needs it -- the child is nothing but a
+        // copy of this frame with a different answer in RAX.
+        "mov rcx, rsp",
         "mov rdx, rsi",
         "mov rsi, rdi",
         "mov rdi, rax",
@@ -232,5 +253,89 @@ unsafe extern "C" fn return_to_kernel() -> ! {
         "ret",
         kdata = const gdt::KERNEL_DATA,
         saved = sym KERNEL_RSP,
+    )
+}
+
+// --- fork ----------------------------------------------------------------
+
+/// How many qwords `syscall_entry` has on the stack when it calls into Rust:
+/// nine saved registers, then the five the CPU pushed.
+const CONTEXT_WORDS: usize = 14;
+
+/// A process that exists but has not run yet.
+pub struct PendingChild {
+    pub context: [u64; CONTEXT_WORDS],
+    pub root: u64,
+}
+
+static mut PENDING: Option<PendingChild> = None;
+
+fn take_pending_child() -> Option<PendingChild> {
+    crate::interrupts::without_interrupts(|| unsafe { (*core::ptr::addr_of_mut!(PENDING)).take() })
+}
+
+/// The classic one: one call, two returns.
+///
+/// Nothing is created from scratch. The child is this exact process — same
+/// registers, same instruction pointer, same stack contents — with two
+/// differences: a duplicated address space, and a zero where the parent gets a
+/// process id. That one difference in one register is the entire way a program
+/// tells which of the two it is.
+///
+/// Everything else about `fork` follows from copy-on-write. Duplicating the
+/// address space costs a few page tables and no data pages at all; see
+/// `AddressSpace::fork`.
+fn fork(context: *mut u64) -> u64 {
+    let parent_root = crate::memory::active_root();
+    let parent = crate::memory::AddressSpace::adopt(parent_root);
+
+    let Some(child_space) = (unsafe { parent.fork() }) else {
+        println!("  [syscall] fork failed: out of memory");
+        return u64::MAX;
+    };
+
+    // Snapshot the parent's entire saved state. The child will be resumed from
+    // this, and it is genuinely identical -- including the return address that
+    // sends it back into the middle of the same `int 0x80`.
+    let mut snapshot = [0u64; CONTEXT_WORDS];
+    for (index, slot) in snapshot.iter_mut().enumerate() {
+        *slot = unsafe { *context.add(index) };
+    }
+
+    let root = child_space.root();
+    // Hand the tables over to the pending child; dropping the AddressSpace
+    // wrapper here must not tear them down.
+    core::mem::forget(child_space);
+
+    crate::interrupts::without_interrupts(|| unsafe {
+        *core::ptr::addr_of_mut!(PENDING) = Some(PendingChild {
+            context: snapshot,
+            root,
+        });
+    });
+
+    println!("  [syscall] fork: child address space {root:#x}, no pages copied yet");
+    1
+}
+
+/// Resume a saved user context, with RAX zeroed.
+///
+/// The pops here must mirror `syscall_entry` exactly, because the buffer was
+/// filled from that function's stack. RAX is not restored: it is set to zero,
+/// which is what makes this the child.
+///
+/// # Safety
+/// `context` must point at CONTEXT_WORDS qwords laid out as syscall_entry's
+/// stack, and the address space it belongs to must already be active.
+#[unsafe(naked)]
+unsafe extern "C" fn resume_user(context: *const u64) -> ! {
+    naked_asm!(
+        "mov rsp, rdi",
+        // fork returns 0 in the child. One register, one difference.
+        "xor rax, rax",
+        "pop rbx",
+        "pop r11", "pop r10", "pop r9",  "pop r8",
+        "pop rdi", "pop rsi", "pop rdx", "pop rcx",
+        "iretq",
     )
 }

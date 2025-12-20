@@ -136,6 +136,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Priorities + aging | working | Starvation ruled out with a bound, not hoped away |
 | FAT16 writes | working | Consistency is an ordering problem, not a coding one |
 | Address spaces | working | A process is a task with its own level-4 table |
+| fork + copy-on-write | working | One call, two returns, and no memory copied |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -740,6 +741,64 @@ debugging and the reasoning in those messages all happened. The calendar did not
 
 ---
 
+## fork
+
+One call, two returns. Nothing is created from scratch — the child is this exact
+process, same registers, same instruction pointer, same memory contents, with a
+single difference: a zero where the parent gets a process id. That one register
+is the entire way a program tells which of the two it is.
+
+```
+5am> exec fork.elf
+  before fork: one process, SHARED = 100
+  [syscall] fork: child address space 0x1fdcf000, no pages copied yet
+  parent: fork returned non-zero, so I am the original
+  parent: wrote 9 to my own copy, exiting
+  [syscall] switching to the forked child
+  child:  SHARED is still 100 -- a private copy, as it should be
+  child:  wrote 7 to my own copy, exiting
+```
+
+The child reads `SHARED` **before** writing to it, after the parent has already
+stored 9. It sees 100. The two processes are looking at different memory.
+
+### Nothing was copied
+
+The obvious implementation of `fork` duplicates every page, and the obvious
+implementation is what made `fork` expensive enough that people invented ways to
+avoid it. Almost every forked program immediately replaces itself with another
+one, so nearly all that copying is thrown away unread.
+
+So copy nothing. Point both address spaces at the same frames, take write
+permission away from **both**, and mark the entries copy-on-write with bit 9 —
+one of three bits the CPU ignores and leaves to the OS. Whoever writes first
+takes a page fault they never see, gets a private copy, and carries on.
+
+That bit matters more than it looks. Without it the fault handler cannot tell a
+page it should silently copy from a page a program has no business writing to,
+and would cheerfully make `.text` writable on demand.
+
+This is also the moment paging stops being a lookup table and becomes a
+mechanism: the kernel gets control at the exact instant a program touches
+memory, and decides what that memory is.
+
+### Two bugs, both about counting to two
+
+**Which ring faulted.** The first version only handled copy-on-write faults from
+ring 3. But the COW bit in the page table is the authority, not the privilege
+level of whoever wrote — the kernel writes into a forked process's memory too.
+Gating on ring 3 made every kernel-side write to a shared page fatal instead of
+routine.
+
+**Decrement, then test.** The reference count was dropped *before* asking how
+many owners there were. Two owners minus one reads as "sole owner", so the
+faulting process kept the shared page and granted itself write access to memory
+the other one was still using — then both freed it. A sharing bug and a double
+free, and it passes every test that does not compare physical frame numbers.
+`selftest cow` compares them.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -950,10 +1009,13 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
-- **Kernel tasks still share one address space.** A ring 3 program gets its own
-  level-4 table, so it cannot see any other program's memory. Kernel tasks are
-  still threads in one space, and there is no `fork` — a process here is
-  something `exec` creates and destroys, not something that reproduces.
+- **Kernel tasks still share one address space.** Ring 3 programs each get their
+  own level-4 table; kernel tasks are threads in one space.
+- **Forked processes do not run concurrently.** The child is queued and runs
+  when the parent exits. They are genuinely two processes with two address
+  spaces — they just take turns, because ring 3 is still not preemptible.
+- **No `exec` after `fork`, and no `wait`.** The pair that makes fork useful in
+  a shell is not here; a child inherits everything and cannot replace itself.
 - **`static mut` is still the idiom** for most kernel state, reached through
   `addr_of_mut!`. Sound today because one core, and protected where it is
   shared; the right long-term answer is `UnsafeCell` behind the locks that now
