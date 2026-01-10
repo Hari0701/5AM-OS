@@ -117,6 +117,10 @@ pub enum Work {
     /// A worker for the `workers` demo: take the shared semaphore, count, and
     /// give it back, sleeping in between so the interleaving is visible.
     Worker(usize),
+    /// Print the tick count every `gap` ticks, `times` times. Exists to make
+    /// preemption observable: if these lines appear *during* a ring 3 program
+    /// that never yields, userspace is genuinely preemptible.
+    Ticker { times: u64, gap: u64 },
     /// Spin without ever blocking, until `ticks` have passed. Used to prove
     /// that a task which never yields cannot starve a lower-priority one.
     Hog(u64),
@@ -265,6 +269,17 @@ extern "C" fn task_entry() -> ! {
     match work {
         Some(Work::Generate(prompt)) => crate::llm::generate(&prompt, 96),
         Some(Work::Worker(index)) => worker(index),
+        Some(Work::Ticker { times, gap }) => {
+            for round in 0..times {
+                sleep(gap);
+                println!(
+                    "  [ticker] still running at tick {} ({}/{})",
+                    crate::interrupts::ticks(),
+                    round + 1,
+                    times
+                );
+            }
+        }
         Some(Work::Hog(ticks)) => {
             // Deliberately never blocks and never sleeps. A plain priority
             // scheduler hands this task the CPU forever.

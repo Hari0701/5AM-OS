@@ -28,6 +28,10 @@ path = "src/bye.rs"
 name = "spawner"
 path = "src/spawner.rs"
 
+[[bin]]
+name = "spin"
+path = "src/spin.rs"
+
 [profile.release]
 panic = "abort"
 # Smaller is better here: every byte gets copied into a user page by hand.

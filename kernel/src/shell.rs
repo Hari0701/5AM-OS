@@ -90,6 +90,7 @@ fn execute(command: &str) {
         "tasks" => crate::task::report(),
         "spawn" => spawn(rest),
         "workers" => workers(),
+        "ticker" => ticker(),
         "selftest" => {
             println!();
             crate::selftest::run(rest.trim());
@@ -153,6 +154,7 @@ fn help() {
     println!("  selftest [suite]  run the kernel's tests against itself");
     println!("                    suites: heap memory space cow sync sched priority elf fat");
     println!("  workers           three tasks share one semaphore, visibly");
+    println!("  ticker            a kernel task that prints while other things run");
     println!("  sleep <ticks>     block this shell on the clock, not a spin");
     println!("  ls                list the files on the FAT16 disk");
     println!("  cat <file>        print a file from that disk");
@@ -315,6 +317,20 @@ fn regs() {
     println!("  RFLAGS {rflags:#018x}   IF={}", (rflags >> 9) & 1);
     println!("         IF is the interrupt flag. It is 1, which is why the");
     println!("         keyboard you just typed on works.");
+}
+
+/// A background task that reports it is still alive.
+///
+/// Start it, then immediately `exec spin.elf` -- a ring 3 program that loops
+/// without ever making a syscall. If the ticker keeps printing while the
+/// spinner runs, the timer is taking the CPU away from ring 3.
+fn ticker() {
+    match crate::task::spawn("ticker", crate::task::Work::Ticker { times: 30, gap: 9 }) {
+        Ok(id) => {
+            println!("  [task {id} ticking -- now run `exec spin.elf`]");
+        }
+        Err(error) => println!("  could not spawn: {error}"),
+    }
 }
 
 /// Three tasks, one semaphore, one counter.

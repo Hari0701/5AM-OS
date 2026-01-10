@@ -58,6 +58,7 @@ FS="target/fs.img"
   fork.elf=userland/target/x86_64-unknown-none/release/forkdemo \
   bye.elf=userland/target/x86_64-unknown-none/release/bye \
   spawn.elf=userland/target/x86_64-unknown-none/release/spawner \
+  spin.elf=userland/target/x86_64-unknown-none/release/spin \
   readme.txt=disk/readme.txt \
   motd.txt=disk/motd.txt
 

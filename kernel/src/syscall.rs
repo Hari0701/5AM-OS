@@ -31,12 +31,26 @@
 //! return address onto an address a user program controls would be handing over
 //! the machine on the first syscall. See `gdt.rs`.
 //!
-//! ## What is deliberately not here yet
+//! ## Userspace is preemptible
 //!
-//! User mode runs with interrupts disabled. The timer would otherwise fire in
-//! ring 3, land in `task.rs`, and try to switch stacks with a privilege change
-//! half-done. Preemptible userspace needs the scheduler to understand rings,
-//! which is the next thing, not this thing.
+//! Ring 3 runs with the interrupt flag set, so the timer fires there like it
+//! fires anywhere else. A program that loops forever without calling anything
+//! is taken off the CPU regardless, which is the difference between an
+//! operating system and an agreement.
+//!
+//! What makes that work is a detail of the trap frame rather than any new
+//! machinery. When the timer interrupts ring 3, the CPU pushes the *user* SS,
+//! RSP, RFLAGS, CS and RIP — a complete description of where the program was —
+//! onto the kernel stack from `TSS.privilege_stack_table[0]`. The existing
+//! timer entry saves the registers around it and hands the stack pointer to the
+//! scheduler, exactly as it does for a kernel task. Resuming means returning
+//! that stack pointer: the `iretq` sees a CS with RPL 3 and drops back to ring
+//! 3 on the user's own stack.
+//!
+//! Nothing about CR3 needs to change on the way out. One user address space is
+//! active at a time, and the kernel is mapped in all of them, so a kernel task
+//! scheduled in the middle of a user program runs perfectly well in that
+//! program's address space.
 
 extern crate alloc;
 
@@ -239,7 +253,11 @@ pub unsafe extern "C" fn enter_ring3(entry: u64, stack: u64) {
         // The frame iretq will consume, pushed in the order the CPU would have.
         "push {udata}",  // SS
         "push rsi",      // RSP -- the user stack
-        "push 0x2",      // RFLAGS: interrupts OFF in user mode, see module docs
+        // RFLAGS with the interrupt flag SET. This one bit is the whole of
+        // preemptible userspace: with it clear, a ring 3 program that never
+        // makes a syscall owns the machine forever, and the only thing that
+        // could take it back was the program's own good manners.
+        "push 0x202",
         "push {ucode}",  // CS -- RPL 3 here is what performs the transition
         "push rdi",      // RIP -- where user code begins
         "iretq",
@@ -266,7 +284,7 @@ pub unsafe extern "C" fn enter_user(entry: u64, stack: u64) -> ! {
         "mov es, ax",
         "push {udata}",
         "push rsi",
-        "push 0x2",
+        "push 0x202",
         "push {ucode}",
         "push rdi",
         "iretq",

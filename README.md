@@ -138,6 +138,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Address spaces | working | A process is a task with its own level-4 table |
 | fork + copy-on-write | working | One call, two returns, and no memory copied |
 | exec + wait | working | The triple every shell has used for fifty years |
+| Preemptible ring 3 | working | An OS, rather than an agreement with the program |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -842,6 +843,45 @@ with no free involved, which surfaced as a log line full of blanks.
 
 ---
 
+### Preemptible ring 3
+
+For most of this project a ring 3 program kept the CPU until it asked for
+something. That is not an operating system, it is an agreement — and the program
+is the only party to it.
+
+```
+5am> ticker
+  [task 1 ticking -- now run `exec spin.elf`]
+5am> exec spin.elf
+  spin:   looping with no syscalls at all. Nothing here yields.
+  [ticker] still running at tick 77 (6/30)
+  spin:   finished. Anything printed above me ran while I spun.
+```
+
+`spin.elf` makes no syscalls between those two lines. It does not yield, sleep
+or cooperate in any way. The ticker printed anyway, because the timer took the
+CPU away on a schedule the program has no say in.
+
+**The change is one bit.** `enter_ring3` pushes an RFLAGS with the interrupt
+flag set instead of clear. Everything else already worked: when the timer
+interrupts ring 3, the CPU pushes the user's SS, RSP, RFLAGS, CS and RIP onto
+the kernel stack from `TSS.privilege_stack_table[0]`, the existing timer entry
+saves the registers around it, and the scheduler treats that stack pointer like
+any other. Resuming means returning it — the `iretq` sees a CS with RPL 3 and
+drops back to ring 3 on the user's own stack.
+
+Nothing about CR3 changes on the way. One user address space is active at a
+time and the kernel is mapped in all of them, so a kernel task scheduled in the
+middle of a user program runs perfectly well inside that program's address
+space.
+
+It was deferred this long not because it was hard but because it is only safe
+once the things around it are right: a kernel stack the user cannot touch, a
+trap frame that describes a privilege change, and a scheduler that can be handed
+a stack pointer it did not create.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1058,10 +1098,10 @@ because reading it is the point.
 - **Forked processes do not run concurrently.** The child is queued and runs
   when the parent exits. They are genuinely two processes with two address
   spaces — they just take turns, because ring 3 is still not preemptible.
-- **Cooperative scheduling only.** A process is switched off the CPU when it
-  makes a syscall that cannot be answered at once — `wait`, or `exit`. One that
-  never calls anything can never be preempted, because the timer still does not
-  fire in ring 3.
+- **Two schedulers.** The timer preempts ring 3 and switches between *kernel
+  tasks*. Two user *processes* still take turns only at syscalls, because the
+  process table and the task table are separate. Unifying them is the next
+  structural change.
 - **No argv, no environment, no file descriptors.** `exec` takes a filename and
   nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through
