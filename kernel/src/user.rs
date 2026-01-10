@@ -60,7 +60,7 @@ pub fn run_bytes(program: &[u8]) {
     println!("  Private address space at {:#x}.", space.root());
     println!("  Reading its program headers:");
 
-    let mut loaded = match unsafe { elf::load(program, true) } {
+    let loaded = match unsafe { elf::load(program, true) } {
         Ok(loaded) => loaded,
         Err(error) => {
             println!("  refusing to run it: {error}");
@@ -75,31 +75,12 @@ pub fn run_bytes(program: &[u8]) {
         loaded.segments, loaded.bytes_zeroed
     );
 
-    // The stack is the loader's job, not the file's: no program header asks for
-    // one. Every process on every OS gets a stack it never requested.
-    for page in 0..USER_STACK_PAGES {
-        let address = USER_STACK_ADDRESS + page * PAGE_SIZE as u64;
-        if memory::translate(address).is_some() {
-            continue;
-        }
-        let Some(frame) = memory::allocator().allocate() else {
-            println!("  out of physical memory for the user stack");
-            unsafe { memory::activate_root(kernel_root) };
-            unsafe { space.destroy() };
-            return;
-        };
-        let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
-        if let Err(error) = unsafe { memory::map_page(address, frame, flags) } {
-            println!("  could not map the user stack: {error}");
-            unsafe { memory::activate_root(kernel_root) };
-            unsafe { space.destroy() };
-            return;
-        }
-        unsafe { core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE) };
-        loaded.pages.push(address);
-    }
-
-    let stack_top = USER_STACK_ADDRESS + USER_STACK_PAGES * PAGE_SIZE as u64;
+    let Some(stack_top) = map_stack() else {
+        println!("  could not map the user stack");
+        unsafe { memory::activate_root(kernel_root) };
+        unsafe { space.destroy() };
+        return;
+    };
     println!(
         "  stack     {USER_STACK_ADDRESS:#010x}  {} bytes, rw-, mapped by the kernel",
         USER_STACK_PAGES * PAGE_SIZE as u64
@@ -110,23 +91,42 @@ pub fn run_bytes(program: &[u8]) {
     println!("  Jumping to {:#x} in ring 3.", loaded.entry);
     println!();
 
+    // From here it is a process: it may fork, exec and exit, and the process
+    // table owns its address space.
+    let root = space.root();
+    core::mem::forget(space);
+    crate::process::install_first(root);
+
     unsafe {
-        // Eight below the top, because a function expects to start life where a
-        // call would have left it. See task.rs for what ignoring that costs.
         syscall::enter_ring3(loaded.entry, stack_top - 8);
     }
 
-    // The program is over, so its address space is rubbish. Switch back to the
-    // kernel's own before tearing it down -- destroying the tables the CPU is
-    // currently translating through would not survive the next instruction.
+    // Every process is finished. Switch back and reclaim all of them.
     unsafe { memory::activate_root(kernel_root) };
-    let freed = unsafe { space.destroy() };
-    let _ = &loaded.pages;
+    let freed = unsafe { crate::process::destroy_all(kernel_root) };
 
     println!();
     println!("  Back in ring 0, by way of {} syscalls.", syscall::count() - before);
-    println!("  Address space destroyed: {freed} frames returned, tables included.");
-    println!("  Nothing of that program is mapped anywhere any more.");
-    println!("  Nothing in that program was compiled with this kernel. The only");
-    println!("  thing they share is the number in `int 0x80`.");
+    println!("  {freed} frames returned; every address space destroyed.");
+}
+
+/// Map a fresh stack into the active address space, returning its top.
+///
+/// No program header ever asks for a stack. Every process on every operating
+/// system gets one it never requested, and this is where that happens here.
+/// `exec` calls it again for the replacement program.
+pub fn map_stack() -> Option<u64> {
+    for page in 0..USER_STACK_PAGES {
+        let address = USER_STACK_ADDRESS + page * PAGE_SIZE as u64;
+        if memory::translate(address).is_some() {
+            continue;
+        }
+        let frame = memory::allocator().allocate()?;
+        let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
+        if unsafe { memory::map_page(address, frame, flags) }.is_err() {
+            return None;
+        }
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE) };
+    }
+    Some(USER_STACK_ADDRESS + USER_STACK_PAGES * PAGE_SIZE as u64)
 }

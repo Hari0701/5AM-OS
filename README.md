@@ -137,6 +137,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | FAT16 writes | working | Consistency is an ordering problem, not a coding one |
 | Address spaces | working | A process is a task with its own level-4 table |
 | fork + copy-on-write | working | One call, two returns, and no memory copied |
+| exec + wait | working | The triple every shell has used for fifty years |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -799,6 +800,48 @@ free, and it passes every test that does not compare physical frame numbers.
 
 ---
 
+### fork, exec, wait
+
+Each is nearly useless alone. `fork` gives you a copy of yourself, which is
+rarely what you wanted. `exec` replaces you, so you could never start something
+*and* carry on. `wait` needs somebody else to wait for. Together they are how
+one process becomes two, one of the two becomes a different program entirely,
+and the original finds out how it went — which is how every Unix shell has
+started every program for fifty years.
+
+```
+5am> exec spawn.elf
+  spawner: about to fork
+  [syscall] fork: pid 1, address space 0x1fdd0000, no pages copied
+  spawner: forked a child, now waiting for it
+  [syscall] pid 0 waits; running pid 1
+  child:   I am the copy. Replacing myself with bye.elf
+  [syscall] exec bye.elf: pid 1 is now a different program
+  bye:    I am a different program now. Exiting with 42.
+  [syscall] pid 1 exit(42)
+  [syscall] pid 0 was waiting -- resuming it with 42
+  spawner: the child exited with 42, which is bye.elf's number
+```
+
+`exec` does not create a process. The pid, the parent, and the fact that
+somebody is waiting all survive it — the same process is simply wearing a
+different program. And it does not return, because the code that called it no
+longer exists.
+
+The switching is one function. `resume_user` restores a saved register frame and
+supplies RAX; the same frame resumed with `0` is a forked child, and resumed
+with an exit code is a parent coming back from `wait`. That is the whole
+mechanism.
+
+**Two bugs worth keeping.** `exec` builds the replacement image *before*
+destroying the old one, so a program that fails to load leaves the caller
+running — which is why a failed `exec` on a real system is an error rather than
+a death. And the filename was being printed after the address space switch: a
+`&str` pointing into memory that no longer means what it did. A use-after-free
+with no free involved, which surfaced as a log line full of blanks.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -981,7 +1024,8 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   memory.rs      physical frames and the page tables
   heap.rs        the allocator behind Vec, String and Box
   task.rs        stacks, the round-robin scheduler, the assembly switch
-  syscall.rs     ring 3, int 0x80, and the only door back in
+  syscall.rs     ring 3, int 0x80, fork, exec, wait
+  process.rs     the process table, and whose turn it is
   elf.rs         reads program headers and loads what they describe
   ata.rs         IDE disk reads, one sector at a time, through the CPU
   fat.rs         FAT16, read-only: root directory and cluster chains
@@ -1014,8 +1058,12 @@ because reading it is the point.
 - **Forked processes do not run concurrently.** The child is queued and runs
   when the parent exits. They are genuinely two processes with two address
   spaces — they just take turns, because ring 3 is still not preemptible.
-- **No `exec` after `fork`, and no `wait`.** The pair that makes fork useful in
-  a shell is not here; a child inherits everything and cannot replace itself.
+- **Cooperative scheduling only.** A process is switched off the CPU when it
+  makes a syscall that cannot be answered at once — `wait`, or `exit`. One that
+  never calls anything can never be preempted, because the timer still does not
+  fire in ring 3.
+- **No argv, no environment, no file descriptors.** `exec` takes a filename and
+  nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through
   `addr_of_mut!`. Sound today because one core, and protected where it is
   shared; the right long-term answer is `UnsafeCell` behind the locks that now

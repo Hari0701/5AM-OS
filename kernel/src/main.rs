@@ -29,6 +29,7 @@ mod memory;
 mod keyboard;
 mod narrate;
 mod oracle;
+mod process;
 mod selftest;
 mod serial;
 mod shell;
