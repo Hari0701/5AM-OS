@@ -72,6 +72,9 @@ pub const SYS_REPORT_CS: u64 = 2;
 pub const SYS_FORK: u64 = 3;
 pub const SYS_EXEC: u64 = 4;
 pub const SYS_WAIT: u64 = 5;
+pub const SYS_PIPE: u64 = 6;
+pub const SYS_READ: u64 = 7;
+pub const SYS_CLOSE: u64 = 8;
 
 /// How many syscalls have crossed the boundary, for the shell.
 static mut COUNT: u64 = 0;
@@ -84,7 +87,13 @@ pub fn count() -> u64 {
 ///
 /// Ordinary Rust, running in ring 0, with the user's arguments in registers.
 /// The returned value ends up in the user's RAX.
-extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, context: *mut u64) -> u64 {
+extern "C" fn dispatch(
+    number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    context: *mut u64,
+) -> u64 {
     // Syscalls run with interrupts ON.
     //
     // The IDT entry is an interrupt gate, so the CPU cleared IF on the way in.
@@ -133,29 +142,21 @@ extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, context: *mut u64) -> 
             }
         }
 
-        SYS_WRITE => {
-            // The one check that makes this a kernel rather than a library.
-            //
-            // arg0 is a pointer chosen by code we do not trust. If it names a
-            // kernel page, dereferencing it would leak kernel memory to ring 3
-            // through a completely legitimate-looking interface -- the program
-            // never left its sandbox, it just asked us to reach out of ours.
-            if !memory::is_user_accessible(arg0, arg1) {
-                println!("  [syscall] write({arg0:#x}, {arg1}) REFUSED");
-                println!("            that address is not user-accessible.");
-                return u64::MAX; // -1
-            }
-            if arg1 > 4096 {
-                return u64::MAX;
-            }
+        // write(fd, pointer, length). The fd is the point: 1 is the console
+        // only because the table says so, and a shell can make it a pipe
+        // instead without the program being told.
+        SYS_WRITE => write(arg0, arg1, arg2),
 
-            let bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1 as usize) };
-            match core::str::from_utf8(bytes) {
-                Ok(text) => {
-                    crate::print!("{text}");
-                    arg1
-                }
-                Err(_) => u64::MAX,
+        SYS_READ => read(arg0, arg1, arg2),
+
+        SYS_PIPE => make_pipe(arg0),
+
+        SYS_CLOSE => {
+            let id = crate::task::current_id();
+            if crate::task::close_descriptor(id, arg0 as usize) {
+                0
+            } else {
+                u64::MAX
             }
         }
 
@@ -208,7 +209,12 @@ pub unsafe extern "C" fn syscall_entry() {
         // Fifteen registers plus the CPU's five-word frame is 160 bytes, so RSP
         // is 16-aligned here and `call` leaves the eight-byte offset the ABI
         // expects.
-        "mov rcx, rsp",
+        // Shift the user's registers into the C argument registers, highest
+        // first so nothing is clobbered before it has been read. The context
+        // pointer goes last, in the fifth slot -- `fork` needs it, because the
+        // child is this frame with a different answer in RAX.
+        "mov r8, rsp",
+        "mov rcx, rdx",
         "mov rdx, rsi",
         "mov rsi, rdi",
         "mov rdi, rax",
@@ -347,5 +353,94 @@ fn exec(path: u64, length: u64, context: *mut u64) -> u64 {
     }
 
     println!("  [syscall] exec {name}: task {id} is now a different program");
+    0
+}
+
+// --- descriptors and pipes ------------------------------------------------
+
+/// Check a user buffer once, in one place, before anything dereferences it.
+fn user_slice(pointer: u64, length: u64) -> Option<(u64, usize)> {
+    if length > 4096 || !memory::is_user_accessible(pointer, length) {
+        return None;
+    }
+    Some((pointer, length as usize))
+}
+
+fn write(fd: u64, pointer: u64, length: u64) -> u64 {
+    let Some((pointer, length)) = user_slice(pointer, length) else {
+        println!("  [syscall] write: refusing {pointer:#x} len {length}");
+        return u64::MAX;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(pointer as *const u8, length) };
+
+    let id = crate::task::current_id();
+    match crate::task::descriptor(id, fd as usize) {
+        crate::task::Descriptor::Console => match core::str::from_utf8(bytes) {
+            Ok(text) => {
+                crate::print!("{text}");
+                length as u64
+            }
+            Err(_) => u64::MAX,
+        },
+        crate::task::Descriptor::PipeWrite(pipe) => crate::pipe::write(pipe, bytes) as u64,
+        // Writing to the read end is not a slip the kernel should paper over.
+        crate::task::Descriptor::PipeRead(_) | crate::task::Descriptor::Free => u64::MAX,
+    }
+}
+
+fn read(fd: u64, pointer: u64, length: u64) -> u64 {
+    let Some((pointer, length)) = user_slice(pointer, length) else {
+        return u64::MAX;
+    };
+
+    let id = crate::task::current_id();
+    match crate::task::descriptor(id, fd as usize) {
+        crate::task::Descriptor::PipeRead(pipe) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(pointer as *mut u8, length) };
+            crate::pipe::read(pipe, out) as u64
+        }
+        // Reading the console would need the keyboard to belong to a process
+        // rather than to the shell, which is a question about terminals and
+        // sessions rather than about pipes.
+        crate::task::Descriptor::Console => u64::MAX,
+        _ => u64::MAX,
+    }
+}
+
+/// `pipe(&mut [read_fd, write_fd])`.
+///
+/// Two descriptors out of one call, which is why it takes a pointer rather than
+/// returning a value: there is no room for two answers in one register, and
+/// packing them would make the caller unpack something the kernel invented.
+fn make_pipe(pointer: u64) -> u64 {
+    if !memory::is_user_accessible(pointer, 16) {
+        println!("  [syscall] pipe: that is not user memory");
+        return u64::MAX;
+    }
+
+    let Some(pipe) = crate::pipe::create() else {
+        println!("  [syscall] pipe: none left");
+        return u64::MAX;
+    };
+
+    let id = crate::task::current_id();
+    let Some(read_fd) = crate::task::add_descriptor(id, crate::task::Descriptor::PipeRead(pipe))
+    else {
+        crate::pipe::close_reader(pipe);
+        crate::pipe::close_writer(pipe);
+        return u64::MAX;
+    };
+    let Some(write_fd) = crate::task::add_descriptor(id, crate::task::Descriptor::PipeWrite(pipe))
+    else {
+        crate::task::close_descriptor(id, read_fd);
+        crate::pipe::close_writer(pipe);
+        return u64::MAX;
+    };
+
+    unsafe {
+        *(pointer as *mut u64) = read_fd as u64;
+        *((pointer as *mut u64).add(1)) = write_fd as u64;
+    }
+    println!("  [syscall] pipe {pipe}: read fd {read_fd}, write fd {write_fd}");
     0
 }

@@ -140,6 +140,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | exec + wait | working | The triple every shell has used for fifty years |
 | Preemptible ring 3 | working | An OS, rather than an agreement with the program |
 | One scheduler | working | A user process is a task with an address space |
+| Pipes + file descriptors | working | End-of-file is a reference count, not a marker |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -925,6 +926,45 @@ in.
 
 ---
 
+### Pipes
+
+Everything two processes here shared until now, they shared by accident of being
+forked from one another — copy-on-write memory neither can write without getting
+a private copy, and an exit code the parent collects. A pipe is the first thing
+built to be shared on purpose.
+
+```
+5am> exec pipe.elf
+  pipe: made a pipe, now forking so both sides inherit it
+  [syscall] fork: task 2, address space 0x1fdcf000, no pages copied
+  parent: closed the write end, reading until end of file
+  child:  closed the read end, writing into the pipe
+  child:  done writing, closing the write end
+  parent: read "hello down the pipe -- and a second write"
+  parent: end of file -- every write end is closed
+```
+
+**A file descriptor is not a file.** It is an index into a per-process table of
+things that can be read or written, which is why `1` means "my output" and can
+be made to mean a pipe instead without the program being told. That indirection
+is the entire reason a shell can redirect anything into anything.
+
+**The buffer is trivial; the edges are the pipe.** Read an empty one and you
+block until somebody writes — unless no writer exists any more, in which case
+you get zero bytes and that means end of file, forever. Write a full one and you
+block until somebody reads. Those two rules are all of flow control: a fast
+producer is slowed to its consumer's speed without either knowing the other
+exists.
+
+**End-of-file is a reference count.** A reader cannot ask "will there be more?",
+so a pipe counts its ends, `fork` bumps the count, and a process that forgets to
+close the write end it inherited hangs the reader forever waiting on a writer
+that exists only as a number. It is the most common pipe bug there is, and it is
+not a bug in the pipe — which is why the demo closes its unused end first and
+says so.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1107,6 +1147,7 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   memory.rs      physical frames and the page tables
   heap.rs        the allocator behind Vec, String and Box
   task.rs        one scheduler: kernel tasks and user processes alike
+  pipe.rs        a bounded buffer, and what happens at its edges
   syscall.rs     ring 3, int 0x80, fork, exec, wait
   elf.rs         reads program headers and loads what they describe
   ata.rs         IDE disk reads, one sector at a time, through the CPU
@@ -1140,10 +1181,11 @@ because reading it is the point.
 - **Forked processes do not run concurrently.** The child is queued and runs
   when the parent exits. They are genuinely two processes with two address
   spaces — they just take turns, because ring 3 is still not preemptible.
-- **No IPC.** Processes can fork, exec and wait, and share nothing else. No
-  pipes, no signals, no shared memory.
-- **No argv, no environment, no file descriptors.** `exec` takes a filename and
-  nothing else, and a program's only output is the `write` syscall.
+- **No signals, no shared memory.** Pipes are the only IPC.
+- **No argv or environment.** `exec` takes a filename and nothing else.
+- **The console is write-only to a process.** `read` on fd 0 fails: the keyboard
+  belongs to the shell, and handing it to a process is a question about
+  terminals and sessions rather than about pipes.
 - **No argv, no environment, no file descriptors.** `exec` takes a filename and
   nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through

@@ -59,6 +59,7 @@ FS="target/fs.img"
   bye.elf=userland/target/x86_64-unknown-none/release/bye \
   spawn.elf=userland/target/x86_64-unknown-none/release/spawner \
   spin.elf=userland/target/x86_64-unknown-none/release/spin \
+  pipe.elf=userland/target/x86_64-unknown-none/release/pipedemo \
   readme.txt=disk/readme.txt \
   motd.txt=disk/motd.txt
 

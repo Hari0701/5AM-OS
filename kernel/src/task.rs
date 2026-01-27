@@ -111,6 +111,25 @@ pub struct Task {
     pub kernel_stack_top: u64,
     /// Work for the task to do, read by `task_entry`.
     pub work: Option<Work>,
+    /// What this task's small integers mean.
+    ///
+    /// A file descriptor is not a file. It is an index into a per-process table
+    /// of things that can be read or written, which is why 1 means "my standard
+    /// output" and can be made to mean a pipe instead without the program
+    /// noticing. That indirection is the whole reason a shell can redirect
+    /// anything into anything.
+    pub files: [Descriptor; MAX_FILES],
+}
+
+pub const MAX_FILES: usize = 8;
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Descriptor {
+    Free,
+    /// The serial console, which is what fds 0, 1 and 2 start as.
+    Console,
+    PipeRead(usize),
+    PipeWrite(usize),
 }
 
 /// What a spawned task is for.
@@ -152,6 +171,7 @@ impl Task {
             parent: None,
             kernel_stack_top: 0,
             work: None,
+            files: [Descriptor::Free; MAX_FILES],
         }
     }
 
@@ -766,7 +786,18 @@ pub fn spawn_user(
         task.waited = 0;
         task.exit_code = 0;
         task.work = None;
+        // Hold the allocation. Dropping it here frees the very stack the task
+        // is about to run on -- which faults only once the heap hands those
+        // bytes to somebody else, so the first symptom is a crash in whatever
+        // allocated next.
         task._stack = Some(stack);
+        task.files = [Descriptor::Free; MAX_FILES];
+        // 0, 1 and 2 are the console, by convention older than this kernel by
+        // several decades. Nothing enforces it -- they are just the first three
+        // slots, and a program that trusts them is trusting whoever set them.
+        task.files[0] = Descriptor::Console;
+        task.files[1] = Descriptor::Console;
+        task.files[2] = Descriptor::Console;
         let bytes = name.as_bytes();
         let len = bytes.len().min(task.name.len());
         task.name[..len].copy_from_slice(&bytes[..len]);
@@ -812,6 +843,18 @@ pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &
         task.waited = 0;
         task.exit_code = 0;
         task.work = None;
+        // Descriptors are inherited, and every pipe end gains an owner. That
+        // count is what end-of-file is made of: a reader learns there will be
+        // no more data only when the last writer is gone, so a child that
+        // inherits a write end and never closes it hangs the reader forever.
+        task.files = tasks_files(parent);
+        for descriptor in task.files.iter() {
+            match descriptor {
+                Descriptor::PipeRead(id) => crate::pipe::add_reader(*id),
+                Descriptor::PipeWrite(id) => crate::pipe::add_writer(*id),
+                _ => {}
+            }
+        }
         task._stack = Some(stack);
         let name = b"child";
         task.name[..name.len()].copy_from_slice(name);
@@ -825,6 +868,63 @@ fn tasks_priority(id: usize) -> u8 {
     tasks()[id].priority
 }
 
+fn tasks_files(id: usize) -> [Descriptor; MAX_FILES] {
+    tasks()[id].files
+}
+
+/// What a descriptor currently refers to.
+pub fn descriptor(id: usize, fd: usize) -> Descriptor {
+    if fd >= MAX_FILES {
+        return Descriptor::Free;
+    }
+    tasks()[id].files[fd]
+}
+
+/// Put something in the lowest free slot, which is what makes the classic
+/// "close it, then open the replacement" redirection trick work.
+pub fn add_descriptor(id: usize, descriptor: Descriptor) -> Option<usize> {
+    without_interrupts(|| {
+        let files = &mut tasks()[id].files;
+        let slot = files.iter().position(|d| *d == Descriptor::Free)?;
+        files[slot] = descriptor;
+        Some(slot)
+    })
+}
+
+/// Drop a descriptor, telling the pipe it has one fewer end.
+pub fn close_descriptor(id: usize, fd: usize) -> bool {
+    let taken = without_interrupts(|| {
+        if fd >= MAX_FILES {
+            return Descriptor::Free;
+        }
+        let files = &mut tasks()[id].files;
+        core::mem::replace(&mut files[fd], Descriptor::Free)
+    });
+    match taken {
+        Descriptor::PipeRead(pipe) => {
+            crate::pipe::close_reader(pipe);
+            true
+        }
+        Descriptor::PipeWrite(pipe) => {
+            crate::pipe::close_writer(pipe);
+            true
+        }
+        Descriptor::Console => true,
+        Descriptor::Free => false,
+    }
+}
+
+/// Close everything a finished task still held open.
+///
+/// Without this a program that exits without closing its pipe ends leaves them
+/// counted forever, and whoever is reading waits for a writer that is not only
+/// gone but was never going to write again.
+pub fn close_all_descriptors(id: usize) {
+    for fd in 0..MAX_FILES {
+        close_descriptor(id, fd);
+    }
+}
+
 /// Swap the address space of the running task, for `exec`.
 pub fn set_address_space(id: usize, root: u64) {
     without_interrupts(|| tasks()[id].address_space = Some(root))
@@ -836,6 +936,7 @@ pub fn address_space_of(id: usize) -> Option<u64> {
 
 /// Finish the current task with a code, and wake whoever is waiting.
 pub fn finish(id: usize, code: u64) {
+    close_all_descriptors(id);
     without_interrupts(|| {
         tasks()[id].exit_code = code;
         tasks()[id].state = State::Finished;

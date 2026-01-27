@@ -84,6 +84,10 @@ pub fn run(which: &str) {
         println!("  copy on write");
         cow(&mut report);
     }
+    if all || which == "pipe" {
+        println!("  pipes");
+        pipes(&mut report);
+    }
     if all || which == "sync" {
         println!("  sync");
         sync(&mut report);
@@ -412,6 +416,74 @@ fn cow(report: &mut Report) {
         free_after == free_before,
         "{free_before} -> {free_after}"
     );
+}
+
+/// A pipe is a buffer; what makes it a pipe is what happens at the edges.
+fn pipes(report: &mut Report) {
+    let Some(id) = crate::pipe::create() else {
+        check!(report, "create a pipe", false, "none free");
+        return;
+    };
+    check!(report, "create a pipe", crate::pipe::in_use(id), "pipe {id}");
+
+    let written = crate::pipe::write(id, b"hello");
+    let mut buffer = [0u8; 16];
+    let read = crate::pipe::read(id, &mut buffer);
+    check!(
+        report,
+        "bytes come out in order",
+        written == 5 && read == 5 && &buffer[..5] == b"hello",
+        "wrote {written}, read {read}"
+    );
+
+    // Wrapping is the part a naive ring buffer gets wrong: fill it, drain it,
+    // then do it again so head and tail are past the end of the array.
+    let big = [b'x'; crate::pipe::CAPACITY];
+    let filled = crate::pipe::write(id, &big);
+    let mut drain = [0u8; crate::pipe::CAPACITY];
+    let drained = crate::pipe::read(id, &mut drain);
+    let again = crate::pipe::write(id, b"wrapped");
+    let mut tail = [0u8; 8];
+    let got = crate::pipe::read(id, &mut tail);
+    check!(
+        report,
+        "the ring wraps",
+        filled == crate::pipe::CAPACITY && drained == crate::pipe::CAPACITY && again == 7 && &tail[..7] == b"wrapped",
+        "{filled} in, {drained} out, then {again} in and {got} out"
+    );
+
+    // End of file is a reference count, not a marker in the data.
+    crate::pipe::close_writer(id);
+    let mut empty = [0u8; 8];
+    let eof = crate::pipe::read(id, &mut empty);
+    check!(
+        report,
+        "no writers means end of file",
+        eof == 0,
+        "read returned {eof}"
+    );
+
+    crate::pipe::close_reader(id);
+    check!(
+        report,
+        "both ends closed frees it",
+        !crate::pipe::in_use(id),
+        "still in use"
+    );
+
+    // And a write with nobody listening must not pretend to succeed.
+    let Some(other) = crate::pipe::create() else {
+        return;
+    };
+    crate::pipe::close_reader(other);
+    let refused = crate::pipe::write(other, b"nobody there");
+    check!(
+        report,
+        "no readers means a short write",
+        refused == 0,
+        "wrote {refused} bytes into a pipe with no reader"
+    );
+    crate::pipe::close_writer(other);
 }
 
 fn sync(report: &mut Report) {

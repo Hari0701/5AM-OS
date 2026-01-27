@@ -20,10 +20,14 @@
 
 const SYS_EXIT: u64 = 0;
 const SYS_WRITE: u64 = 1;
+/// File descriptor 1. Not a law -- just the slot the kernel filled in with the
+/// console, and the one every program has agreed to mean "my output" since
+/// before any of this existed.
+const STDOUT: u64 = 1;
 const SYS_FORK: u64 = 3;
 
 #[inline(always)]
-unsafe fn syscall(number: u64, arg0: u64, arg1: u64) -> u64 {
+unsafe fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     let result: u64;
     unsafe {
         core::arch::asm!(
@@ -31,17 +35,18 @@ unsafe fn syscall(number: u64, arg0: u64, arg1: u64) -> u64 {
             inlateout("rax") number => result,
             in("rdi") arg0,
             in("rsi") arg1,
+            in("rdx") arg2,
         );
     }
     result
 }
 
 fn write(text: &str) -> u64 {
-    unsafe { syscall(SYS_WRITE, text.as_ptr() as u64, text.len() as u64) }
+    unsafe { syscall(SYS_WRITE, STDOUT, text.as_ptr() as u64, text.len() as u64) }
 }
 
 fn exit(code: u64) -> ! {
-    unsafe { syscall(SYS_EXIT, code, 0) };
+    unsafe { syscall(SYS_EXIT, code, 0, 0) };
     loop {}
 }
 
@@ -53,7 +58,7 @@ static mut SHARED: u64 = 100;
 pub extern "C" fn _start() -> ! {
     write("  before fork: one process, SHARED = 100\n");
 
-    let result = unsafe { syscall(SYS_FORK, 0, 0) };
+    let result = unsafe { syscall(SYS_FORK, 0, 0, 0) };
 
     // Read before writing. A read of a copy-on-write page is allowed and
     // costs nothing -- it is only the write that has to be intercepted.
