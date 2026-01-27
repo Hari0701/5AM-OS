@@ -139,6 +139,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | fork + copy-on-write | working | One call, two returns, and no memory copied |
 | exec + wait | working | The triple every shell has used for fifty years |
 | Preemptible ring 3 | working | An OS, rather than an agreement with the program |
+| One scheduler | working | A user process is a task with an address space |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -882,6 +883,48 @@ a stack pointer it did not create.
 
 ---
 
+### One scheduler
+
+There were two for a while, and the seam showed. `task.rs` preempted kernel
+tasks on a timer; `process.rs` switched user processes by hand whenever one made
+a syscall it could not answer. Two tables, two ideas of *whose turn it is*, and
+two ways to save a task — which is why a forked parent and child could only ever
+take turns rather than run.
+
+They are one now, and the merge **deleted** more than it added.
+
+**A user process is a task with an address space.** Two extra fields — a level-4
+table and a kernel stack of its own — and the scheduler stops caring which kind
+it is picking. `wait` needed no new machinery at all: a child is a task, so
+waiting for one is the blocked state and wait channel that already existed.
+
+What made it possible was making both save paths identical. The timer pushed
+fifteen registers; the syscall path pushed nine, chosen for stack alignment.
+That difference *was* the seam — a task saved by the timer and one saved by a
+syscall had different shapes, so each needed its own way to be resumed. Saving
+identically means a task is a task, and the scheduler never asks how it stopped
+running.
+
+`exec` gets to be strange in a good way: rather than jumping to ring 3 itself,
+it rewrites the trap frame it was called *from* — new entry point, new stack,
+registers zeroed — and lets `syscall_entry` pop and `iretq` exactly as it always
+would, landing in a different program.
+
+**Two bugs, both about what a kernel task inherits.**
+
+Syscalls arrive through an interrupt gate, so the CPU clears the interrupt flag.
+That was right while no syscall could block. The moment `exit` and `wait` began
+parking the task it became fatal: `hlt` with interrupts disabled is not a pause,
+it is the end of the machine. Syscalls now run with interrupts on, which is safe
+for a reason that was not true before — every task has its own kernel stack.
+
+And a kernel task with no address space of its own was inheriting whichever user
+space was last active. Harmless for execution, since the kernel is mapped in all
+of them, right up until the shell destroyed the address space it was standing
+in.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1063,9 +1106,8 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   ai.rs          the serial protocol for talking to a model
   memory.rs      physical frames and the page tables
   heap.rs        the allocator behind Vec, String and Box
-  task.rs        stacks, the round-robin scheduler, the assembly switch
+  task.rs        one scheduler: kernel tasks and user processes alike
   syscall.rs     ring 3, int 0x80, fork, exec, wait
-  process.rs     the process table, and whose turn it is
   elf.rs         reads program headers and loads what they describe
   ata.rs         IDE disk reads, one sector at a time, through the CPU
   fat.rs         FAT16, read-only: root directory and cluster chains
@@ -1098,10 +1140,10 @@ because reading it is the point.
 - **Forked processes do not run concurrently.** The child is queued and runs
   when the parent exits. They are genuinely two processes with two address
   spaces — they just take turns, because ring 3 is still not preemptible.
-- **Two schedulers.** The timer preempts ring 3 and switches between *kernel
-  tasks*. Two user *processes* still take turns only at syscalls, because the
-  process table and the task table are separate. Unifying them is the next
-  structural change.
+- **No IPC.** Processes can fork, exec and wait, and share nothing else. No
+  pipes, no signals, no shared memory.
+- **No argv, no environment, no file descriptors.** `exec` takes a filename and
+  nothing else, and a program's only output is the `write` syscall.
 - **No argv, no environment, no file descriptors.** `exec` takes a filename and
   nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through

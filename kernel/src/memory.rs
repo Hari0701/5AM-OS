@@ -692,6 +692,24 @@ unsafe fn free_subtree(table: u64, level: usize) -> usize {
     freed + 1
 }
 
+/// The kernel's own level-4 table: the one the bootloader handed over.
+static mut KERNEL_ROOT: u64 = 0;
+
+/// Remember the address space the kernel started in.
+///
+/// Tasks that have no address space of their own must run in *this* one, not in
+/// whichever user space happened to be active when they were scheduled. Letting
+/// them inherit was fine for execution -- the kernel is mapped everywhere -- but
+/// it made `active_root()` mean "wherever we happen to be", and the shell then
+/// went on to destroy an address space it was standing in.
+pub fn remember_kernel_root() {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(KERNEL_ROOT), read_cr3()) };
+}
+
+pub fn kernel_root() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(KERNEL_ROOT)) }
+}
+
 /// The address space the CPU is using right now.
 pub fn active_root() -> u64 {
     read_cr3()

@@ -87,27 +87,50 @@ pub fn run_bytes(program: &[u8]) {
     );
 
     let before = syscall::count();
-    println!();
-    println!("  Jumping to {:#x} in ring 3.", loaded.entry);
-    println!();
-
-    // From here it is a process: it may fork, exec and exit, and the process
-    // table owns its address space.
     let root = space.root();
     core::mem::forget(space);
-    crate::process::install_first(root);
 
-    unsafe {
-        syscall::enter_ring3(loaded.entry, stack_top - 8);
-    }
+    // Spawn it as a task rather than diving into ring 3 from here.
+    //
+    // This is what unifying the schedulers bought. The shell used to *become*
+    // the user program -- one call that did not return until the program
+    // exited -- so nothing else could happen in between and the two of them
+    // shared a single kernel stack. Now a user program is a task with an
+    // address space, the scheduler switches to it like anything else, and the
+    // shell simply waits for it the same way it waits for a kernel task.
+    let id = match crate::task::spawn_user("prog", loaded.entry, stack_top - 8, root, Some(0)) {
+        Ok(id) => id,
+        Err(error) => {
+            println!("  could not start it: {error}");
+            unsafe { memory::activate_root(kernel_root) };
+            unsafe { memory::AddressSpace::adopt(root).destroy() };
+            return;
+        }
+    };
 
-    // Every process is finished. Switch back and reclaim all of them.
+    // Back to the kernel's own address space. The scheduler will install the
+    // program's when it runs it.
     unsafe { memory::activate_root(kernel_root) };
-    let freed = unsafe { crate::process::destroy_all(kernel_root) };
 
     println!();
-    println!("  Back in ring 0, by way of {} syscalls.", syscall::count() - before);
-    println!("  {freed} frames returned; every address space destroyed.");
+    println!("  Task {id} is now running it in ring 3.");
+    println!();
+
+    let code = crate::task::wait_any_child(0);
+
+    // Reclaim whatever the program and any children it forked left behind.
+    let mut freed = 0;
+    for root in crate::task::orphan_address_spaces() {
+        freed += unsafe { memory::AddressSpace::adopt(root).destroy() };
+    }
+    crate::task::reap_finished();
+
+    println!();
+    match code {
+        Some(code) => println!("  Task {id} exited with {code}."),
+        None => println!("  Task {id} is gone."),
+    }
+    println!("  {} syscalls, {freed} frames returned.", syscall::count() - before);
 }
 
 /// Map a fresh stack into the active address space, returning its top.

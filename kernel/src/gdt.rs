@@ -188,6 +188,19 @@ pub unsafe fn init() {
     }
 }
 
+/// Point the CPU at a different kernel stack for the next entry from ring 3.
+///
+/// Every task that can run in ring 3 needs its own, and the scheduler sets this
+/// on every switch. Share one and the second task to be interrupted writes its
+/// trap frame over the first one's -- which does not fault, it just resumes the
+/// wrong program.
+pub fn set_kernel_stack(top: u64) {
+    unsafe {
+        let tss = &mut *core::ptr::addr_of_mut!(TSS);
+        tss.privilege_stack_table[0] = top;
+    }
+}
+
 /// Read back what the CPU thinks its GDT is — used by `explain gdt`.
 pub fn current() -> (u64, u16) {
     let mut pointer = DescriptorTablePointer { limit: 0, base: 0 };

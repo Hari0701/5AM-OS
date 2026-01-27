@@ -101,6 +101,14 @@ pub struct Task {
     pub waited: u16,
     /// What the task returned, once it has finished.
     pub exit_code: u64,
+    /// The level-4 table this task runs on, for tasks that have one of their
+    /// own. Kernel tasks leave it None and run on whatever is active -- the
+    /// kernel is mapped in every address space, so it does not matter which.
+    pub address_space: Option<u64>,
+    /// Who is entitled to this task's exit code.
+    pub parent: Option<usize>,
+    /// Top of this task's kernel stack, for `TSS.RSP0`.
+    pub kernel_stack_top: u64,
     /// Work for the task to do, read by `task_entry`.
     pub work: Option<Work>,
 }
@@ -140,6 +148,9 @@ impl Task {
             priority: DEFAULT_PRIORITY,
             waited: 0,
             exit_code: 0,
+            address_space: None,
+            parent: None,
+            kernel_stack_top: 0,
             work: None,
         }
     }
@@ -166,6 +177,7 @@ pub fn current_id() -> usize {
 /// It needs no stack allocated — it is standing on one. Its saved stack pointer
 /// gets filled in the first time it is switched away from.
 pub fn init() {
+    crate::memory::remember_kernel_root();
     let tasks = tasks();
     tasks[0].state = State::Ready;
     let name = b"shell";
@@ -206,6 +218,9 @@ pub fn spawn_with_priority(
         let task = &mut tasks[id];
         task.state = State::Ready;
         task.stack_pointer = stack_pointer;
+        task.kernel_stack_top = top;
+        task.address_space = None;
+        task.parent = None;
         task._stack = Some(stack);
         task.switches = 0;
         task.work = Some(work);
@@ -378,6 +393,31 @@ extern "C" fn schedule(stack_pointer: u64) -> u64 {
     if next != current {
         unsafe { CURRENT = next };
         tasks[next].switches += 1;
+
+        // Two things have to follow the task, and forgetting either is a bug
+        // that shows up somewhere else entirely.
+        //
+        // The address space, so a user task resumes seeing its own memory. A
+        // kernel task has none and keeps whatever is active, which is safe
+        // precisely because the kernel half is identical in all of them.
+        // A task with no address space of its own runs in the kernel's, not in
+        // whatever the last user task left behind. Inheriting works -- the
+        // kernel is mapped in every space -- right up until the shell tries to
+        // destroy the space it is currently standing in.
+        let want = tasks[next]
+            .address_space
+            .unwrap_or_else(crate::memory::kernel_root);
+        if want != 0 && want != crate::memory::active_root() {
+            unsafe { crate::memory::activate_root(want) };
+        }
+
+        // And the kernel stack the CPU will use the next time this task enters
+        // ring 0. Share one between two ring 3 tasks and the second to be
+        // interrupted overwrites the first one's trap frame -- no fault, just
+        // the wrong program resuming.
+        if tasks[next].kernel_stack_top != 0 {
+            crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top);
+        }
     }
     tasks[next].stack_pointer
 }
@@ -658,4 +698,230 @@ pub fn counter_value() -> u64 {
 
 pub fn reset_counter() {
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(COUNTER), 0) };
+}
+
+// --- user tasks ----------------------------------------------------------
+
+/// Lay out a frame in the exact shape `timer_entry` pops, so the scheduler can
+/// resume anything with one code path.
+///
+/// This is the change that unified the two schedulers. There used to be two
+/// save formats -- the timer's fifteen registers plus a trap frame, and the
+/// syscall path's smaller one -- which meant two ways to resume and two places
+/// that had to agree. Now `syscall_entry` saves in the same shape, and a task
+/// is a task whether it was interrupted or made a call.
+///
+/// # Safety
+/// `top` must be the 16-aligned top of a stack with room for the frame.
+pub unsafe fn build_user_frame(top: u64, entry: u64, user_stack: u64) -> u64 {
+    let mut sp = top;
+    let mut push = |value: u64| {
+        sp -= 8;
+        unsafe { *(sp as *mut u64) = value };
+    };
+
+    push(gdt::USER_DATA as u64); // SS
+    push(user_stack);            // RSP -- the user's own stack
+    push(0x202);                 // RFLAGS: interrupts ON, so ring 3 is preemptible
+    push(gdt::USER_CODE as u64); // CS -- RPL 3 is what performs the transition
+    push(entry);                 // RIP
+
+    // Fifteen registers, all zero. A fresh program has no history.
+    for _ in 0..15 {
+        push(0);
+    }
+    sp
+}
+
+/// Create a task that runs a program in ring 3.
+///
+/// It differs from a kernel task in exactly two fields -- an address space and
+/// a trap frame with ring 3 selectors -- and in nothing else. The scheduler
+/// does not know or care which kind it is picking.
+pub fn spawn_user(
+    name: &str,
+    entry: u64,
+    user_stack: u64,
+    root: u64,
+    parent: Option<usize>,
+) -> Result<usize, &'static str> {
+    without_interrupts(|| {
+        let tasks = tasks();
+        let id = (1..MAX_TASKS)
+            .find(|&i| tasks[i].state == State::Free)
+            .ok_or("no free task slots")?;
+
+        let stack: Box<[u8]> = vec![0u8; STACK_SIZE].into_boxed_slice();
+        let top = (stack.as_ptr() as u64 + STACK_SIZE as u64) & !0xF;
+        let stack_pointer = unsafe { build_user_frame(top, entry, user_stack) };
+
+        let task = &mut tasks[id];
+        task.state = State::Ready;
+        task.stack_pointer = stack_pointer;
+        task.kernel_stack_top = top;
+        task.address_space = Some(root);
+        task.parent = parent;
+        task.switches = 0;
+        task.priority = DEFAULT_PRIORITY;
+        task.waited = 0;
+        task.exit_code = 0;
+        task.work = None;
+        task._stack = Some(stack);
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(task.name.len());
+        task.name[..len].copy_from_slice(&bytes[..len]);
+        task.name_len = len;
+
+        Ok(id)
+    })
+}
+
+/// Copy a running task's trap frame onto a new task's stack: `fork`.
+///
+/// The child is the parent, exactly, with a different address space and a zero
+/// in RAX. Because both are now saved in the same format, that is a memcpy and
+/// one store.
+pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &'static str> {
+    without_interrupts(|| {
+        let tasks = tasks();
+        let id = (1..MAX_TASKS)
+            .find(|&i| tasks[i].state == State::Free)
+            .ok_or("no free task slots")?;
+
+        let stack: Box<[u8]> = vec![0u8; STACK_SIZE].into_boxed_slice();
+        let top = (stack.as_ptr() as u64 + STACK_SIZE as u64) & !0xF;
+
+        // Twenty qwords: fifteen registers, then RIP, CS, RFLAGS, RSP, SS.
+        const WORDS: usize = 20;
+        let sp = top - (WORDS * 8) as u64;
+        for index in 0..WORDS {
+            unsafe { *((sp as *mut u64).add(index)) = *frame.add(index) };
+        }
+        // RAX was pushed first, so it sits at the top of the register block.
+        // Zero is what makes this the child.
+        unsafe { *((sp as *mut u64).add(14)) = 0 };
+
+        let task = &mut tasks[id];
+        task.state = State::Ready;
+        task.stack_pointer = sp;
+        task.kernel_stack_top = top;
+        task.address_space = Some(root);
+        task.parent = Some(parent);
+        task.switches = 0;
+        task.priority = tasks_priority(parent);
+        task.waited = 0;
+        task.exit_code = 0;
+        task.work = None;
+        task._stack = Some(stack);
+        let name = b"child";
+        task.name[..name.len()].copy_from_slice(name);
+        task.name_len = name.len();
+
+        Ok(id)
+    })
+}
+
+fn tasks_priority(id: usize) -> u8 {
+    tasks()[id].priority
+}
+
+/// Swap the address space of the running task, for `exec`.
+pub fn set_address_space(id: usize, root: u64) {
+    without_interrupts(|| tasks()[id].address_space = Some(root))
+}
+
+pub fn address_space_of(id: usize) -> Option<u64> {
+    tasks()[id].address_space
+}
+
+/// Finish the current task with a code, and wake whoever is waiting.
+pub fn finish(id: usize, code: u64) {
+    without_interrupts(|| {
+        tasks()[id].exit_code = code;
+        tasks()[id].state = State::Finished;
+    });
+    wake_all(id as u64);
+}
+
+/// Block until any child of `parent` finishes, and take its exit code.
+///
+/// This is `wait`, and it needed no new machinery at all: a child is a task, so
+/// waiting for one is the blocked state and the wait channel that already
+/// existed. Unifying the schedulers deleted the bespoke version.
+pub fn wait_any_child(parent: usize) -> Option<u64> {
+    // Anything to wait for?
+    let any = tasks()
+        .iter()
+        .enumerate()
+        .any(|(id, t)| t.parent == Some(parent) && t.state != State::Free && id != parent);
+    if !any {
+        return None;
+    }
+
+    loop {
+        // Collect a finished child if there is one. Reaping here is what stops
+        // it being a zombie -- a task that has stopped running and cannot be
+        // forgotten because nobody has read its answer.
+        let collected = without_interrupts(|| {
+            let tasks = tasks();
+            for id in 0..MAX_TASKS {
+                if tasks[id].parent != Some(parent) || tasks[id].state != State::Finished {
+                    continue;
+                }
+                let code = tasks[id].exit_code;
+                // Take the address space *before* clearing the slot, or it is
+                // simply lost: unreachable and still allocated, with nothing
+                // left in the table pointing at it.
+                if let Some(root) = tasks[id].address_space.take() {
+                    orphans().push(root);
+                }
+                tasks[id] = Task::empty();
+                return Some(code);
+            }
+            None
+        });
+        if let Some(code) = collected {
+            return Some(code);
+        }
+
+        // Still running. Block on the child's own channel rather than polling:
+        // a poll loop here would make the waiter runnable on every tick and
+        // starve the very task it is waiting for.
+        let child = tasks()
+            .iter()
+            .position(|t| t.parent == Some(parent) && t.state != State::Free)?;
+        block_until(child as u64, || {
+            let state = tasks()[child].state;
+            if state == State::Finished || state == State::Free {
+                Some(())
+            } else {
+                None
+            }
+        });
+    }
+}
+
+/// Address spaces whose task is gone, waiting to be reclaimed.
+static mut ORPHANS: Option<Vec<u64>> = None;
+
+fn orphans() -> &'static mut Vec<u64> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(ORPHANS);
+        slot.get_or_insert_with(Vec::new)
+    }
+}
+
+/// Every address space left over by a finished task. Taken out of the table as
+/// they are collected, so nothing can be freed twice.
+pub fn orphan_address_spaces() -> Vec<u64> {
+    without_interrupts(|| {
+        for task in tasks().iter_mut() {
+            if matches!(task.state, State::Finished | State::Free) {
+                if let Some(root) = task.address_space.take() {
+                    orphans().push(root);
+                }
+            }
+        }
+        core::mem::take(orphans())
+    })
 }

@@ -169,13 +169,23 @@ fn heap(report: &mut Report) {
         drop(c);
     }
     let after_cycles = crate::heap::stats();
+    // Compare the hole count to what it was before the cycles, not to one.
+    //
+    // Asserting "exactly one hole" quietly assumed the heap was otherwise
+    // empty, which stopped being true the moment the kernel kept any long-lived
+    // allocation -- the copy-on-write share table, for instance. A live
+    // allocation splits the free space in two and the check failed, reporting a
+    // leak that was not there. The property that actually matters is that
+    // coalescing puts the heap back exactly as it found it.
     check!(
         report,
-        "200 cycles leave one hole",
-        after_cycles.1 == 1 && after_cycles.0 == before.0,
-        "{} holes, {} bytes free",
+        "200 cycles change nothing",
+        after_cycles.1 == before.1 && after_cycles.0 == before.0,
+        "{} holes and {} bytes free, started at {} and {}",
         after_cycles.1,
-        after_cycles.0
+        after_cycles.0,
+        before.1,
+        before.0
     );
 }
 
