@@ -914,6 +914,31 @@ pub fn close_descriptor(id: usize, fd: usize) -> bool {
     }
 }
 
+/// Point `new` at whatever `old` refers to, closing whatever `new` was.
+///
+/// The pipe gains an owner, because two descriptors now name the same end and
+/// end-of-file is counted, not observed.
+pub fn duplicate_descriptor(id: usize, old: usize, new: usize) -> bool {
+    if old >= MAX_FILES || new >= MAX_FILES {
+        return false;
+    }
+    let source = descriptor(id, old);
+    if source == Descriptor::Free {
+        return false;
+    }
+    if old == new {
+        return true;
+    }
+    close_descriptor(id, new);
+    match source {
+        Descriptor::PipeRead(pipe) => crate::pipe::add_reader(pipe),
+        Descriptor::PipeWrite(pipe) => crate::pipe::add_writer(pipe),
+        _ => {}
+    }
+    without_interrupts(|| tasks()[id].files[new] = source);
+    true
+}
+
 /// Close everything a finished task still held open.
 ///
 /// Without this a program that exits without closing its pipe ends leaves them

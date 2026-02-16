@@ -141,6 +141,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Preemptible ring 3 | working | An OS, rather than an agreement with the program |
 | One scheduler | working | A user process is a task with an address space |
 | Pipes + file descriptors | working | End-of-file is a reference count, not a marker |
+| A shell in ring 3 | working | fork + exec + wait + pipe, and nothing else |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -965,6 +966,57 @@ says so.
 
 ---
 
+### A shell that is just a program
+
+The shell built into this kernel was always in the wrong place. It could read
+the keyboard because it *was* the kernel, it started programs by calling a
+function, and it could not have been replaced without rebuilding the machine.
+None of that is how a shell works anywhere, and all of it hid what a shell is
+for.
+
+```
+5am> exec sh.elf
+
+  A shell, running in ring 3 like anything else.
+
+$ greet.elf
+  [syscall] fork: task 2, address space 0x1fdcf000, no pages copied
+  [syscall] exec greet.elf: task 2 is now a different program
+hello from one side of a pipe
+
+$ greet.elf | upper.elf
+  [syscall] pipe 0: read fd 3, write fd 4
+  [syscall] fork: task 2, address space 0x1fdcf000, no pages copied
+  [syscall] fork: task 3, address space 0x1fdbf000, no pages copied
+HELLO FROM ONE SIDE OF A PIPE
+
+$ exit
+  Task 1 exited with 0.
+  89 syscalls, 56 frames returned.
+```
+
+**A shell is not a special program.** It is the smallest possible demonstration
+that four system calls are enough. `fork`, because the shell has to survive the
+command it runs. `exec`, so the copy can stop being a shell. `wait`, so the
+original learns when it finished. And `pipe` with `dup2`, to put one program's
+output where another's input should be.
+
+`greet.elf` and `upper.elf` know nothing about each other or about pipes. One
+writes to descriptor 1 and the other reads descriptor 0, exactly as they would
+at a terminal. The shell rearranged those descriptors in the child, between
+`fork` and `exec`, and neither program was told. That is the whole reason
+independently written tools compose at all.
+
+The echoing is the shell's job too — nothing has been printed by the time those
+bytes arrive, which is why a password prompt can simply decline to echo using
+the same interface as everything else.
+
+The kernel keeps its own shell, and it is still what starts this one. On a real
+system the first process *is* userspace; here `exec sh.elf` is something you
+type, which is one honest step short.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1156,7 +1208,7 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   selftest.rs    the suites behind `selftest`, and the labs' pass/fail
   user.rs        maps a stack and starts the loaded program
 bridge/          runs on your machine: serial <-> Claude API
-userland/        a program, not a kernel. built separately, loaded as ELF
+userland/        programs, not kernels: a shell, a filter, and the demos
 mkfs/            runs on your machine: writes the FAT16 disk image
 disk/            text files that end up on that disk
 exercises/       labs: delete a function, put it back, run the tests
@@ -1183,9 +1235,11 @@ because reading it is the point.
   spaces — they just take turns, because ring 3 is still not preemptible.
 - **No signals, no shared memory.** Pipes are the only IPC.
 - **No argv or environment.** `exec` takes a filename and nothing else.
-- **The console is write-only to a process.** `read` on fd 0 fails: the keyboard
-  belongs to the shell, and handing it to a process is a question about
-  terminals and sessions rather than about pipes.
+- **One terminal, no job control.** Whichever process reads the console gets the
+  next keystroke. No foreground process group, no Ctrl-C, no background jobs.
+- **The kernel shell is still there**, and is still the thing that starts the
+  user shell. A real system's first process *is* userspace; here `exec sh.elf`
+  is a command you type.
 - **No argv, no environment, no file descriptors.** `exec` takes a filename and
   nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through

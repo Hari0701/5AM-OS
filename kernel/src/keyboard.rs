@@ -182,6 +182,21 @@ pub fn wait_key() -> Key {
     crate::task::block_until(INPUT_CHANNEL, next_key)
 }
 
+/// One byte of typed input, from either console, or None if nothing is waiting.
+///
+/// A shell wants bytes, not keys: it does its own echoing and its own line
+/// editing, which is the arrangement every terminal has had since terminals
+/// were furniture. The kernel's job is to deliver what was typed and stay out
+/// of the way.
+pub fn next_byte() -> Option<u8> {
+    match next_key() {
+        Some(Key::Char(c)) => Some(c as u8),
+        Some(Key::Enter) => Some(b'\n'),
+        Some(Key::Backspace) => Some(0x08),
+        None => None,
+    }
+}
+
 /// A key from either console: the serial line or the PS/2 keyboard.
 ///
 /// Both are real inputs and the shell must not care which one you used. Serial

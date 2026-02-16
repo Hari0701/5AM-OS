@@ -75,6 +75,7 @@ pub const SYS_WAIT: u64 = 5;
 pub const SYS_PIPE: u64 = 6;
 pub const SYS_READ: u64 = 7;
 pub const SYS_CLOSE: u64 = 8;
+pub const SYS_DUP2: u64 = 9;
 
 /// How many syscalls have crossed the boundary, for the shell.
 static mut COUNT: u64 = 0;
@@ -150,6 +151,21 @@ extern "C" fn dispatch(
         SYS_READ => read(arg0, arg1, arg2),
 
         SYS_PIPE => make_pipe(arg0),
+
+        // dup2(old, new): make `new` refer to whatever `old` does.
+        //
+        // This is the whole of redirection. A shell building a pipeline forks,
+        // and in the child moves a pipe end onto descriptor 0 or 1 -- then
+        // execs a program that knows nothing about pipes and writes to its
+        // output exactly as it always would.
+        SYS_DUP2 => {
+            let id = crate::task::current_id();
+            if crate::task::duplicate_descriptor(id, arg0 as usize, arg1 as usize) {
+                arg1
+            } else {
+                u64::MAX
+            }
+        }
 
         SYS_CLOSE => {
             let id = crate::task::current_id();
@@ -399,10 +415,31 @@ fn read(fd: u64, pointer: u64, length: u64) -> u64 {
             let out = unsafe { core::slice::from_raw_parts_mut(pointer as *mut u8, length) };
             crate::pipe::read(pipe, out) as u64
         }
-        // Reading the console would need the keyboard to belong to a process
-        // rather than to the shell, which is a question about terminals and
-        // sessions rather than about pipes.
-        crate::task::Descriptor::Console => u64::MAX,
+        crate::task::Descriptor::Console => {
+            let out = unsafe { core::slice::from_raw_parts_mut(pointer as *mut u8, length) };
+            if out.is_empty() {
+                return 0;
+            }
+            // Block for the first byte, then take whatever else has already
+            // arrived. Returning as soon as there is *something* is what makes
+            // a terminal feel immediate -- waiting for the buffer to fill would
+            // mean a shell that answers only every 64 keystrokes.
+            let first = crate::task::block_until(crate::keyboard::INPUT_CHANNEL, || {
+                crate::interrupts::without_interrupts(crate::keyboard::next_byte)
+            });
+            out[0] = first;
+            let mut count = 1;
+            while count < out.len() {
+                match crate::interrupts::without_interrupts(crate::keyboard::next_byte) {
+                    Some(byte) => {
+                        out[count] = byte;
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            count as u64
+        }
         _ => u64::MAX,
     }
 }

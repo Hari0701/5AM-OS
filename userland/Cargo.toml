@@ -36,6 +36,18 @@ path = "src/spin.rs"
 name = "pipedemo"
 path = "src/pipedemo.rs"
 
+[[bin]]
+name = "sh"
+path = "src/sh.rs"
+
+[[bin]]
+name = "greet"
+path = "src/greet.rs"
+
+[[bin]]
+name = "upper"
+path = "src/upper.rs"
+
 [profile.release]
 panic = "abort"
 # Smaller is better here: every byte gets copied into a user page by hand.
