@@ -48,6 +48,10 @@ path = "src/greet.rs"
 name = "upper"
 path = "src/upper.rs"
 
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
 [profile.release]
 panic = "abort"
 # Smaller is better here: every byte gets copied into a user page by hand.

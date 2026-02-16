@@ -63,6 +63,7 @@ FS="target/fs.img"
   sh.elf=userland/target/x86_64-unknown-none/release/sh \
   greet.elf=userland/target/x86_64-unknown-none/release/greet \
   upper.elf=userland/target/x86_64-unknown-none/release/upper \
+  echo.elf=userland/target/x86_64-unknown-none/release/echo \
   readme.txt=disk/readme.txt \
   motd.txt=disk/motd.txt
 

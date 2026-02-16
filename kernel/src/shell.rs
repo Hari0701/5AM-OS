@@ -26,6 +26,15 @@ pub fn run() -> ! {
     let mut len = 0usize;
 
     banner();
+
+    // Hand the machine to userspace before offering a kernel prompt at all.
+    //
+    // On a real system the first process *is* userspace: the kernel finishes
+    // booting and runs one program, and everything else descends from it. This
+    // is that, one step short -- if init cannot be started or exits, the kernel
+    // shell below is the fallback, which a real machine would call a panic.
+    crate::user::start_init();
+
     prompt();
 
     loop {

@@ -142,6 +142,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | One scheduler | working | A user process is a task with an address space |
 | Pipes + file descriptors | working | End-of-file is a reference count, not a marker |
 | A shell in ring 3 | working | fork + exec + wait + pipe, and nothing else |
+| argv + init | working | The machine boots into userspace and stays there |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -975,9 +976,12 @@ None of that is how a shell works anywhere, and all of it hid what a shell is
 for.
 
 ```
-5am> exec sh.elf
+[init] starting sh.elf as the first user process
 
   A shell, running in ring 3 like anything else.
+
+$ echo.elf hello argv world
+hello argv world
 
 $ greet.elf
   [syscall] fork: task 2, address space 0x1fdcf000, no pages copied
@@ -1011,9 +1015,25 @@ The echoing is the shell's job too — nothing has been printed by the time thos
 bytes arrive, which is why a password prompt can simply decline to echo using
 the same interface as everything else.
 
-The kernel keeps its own shell, and it is still what starts this one. On a real
-system the first process *is* userspace; here `exec sh.elf` is something you
-type, which is one honest step short.
+### Arguments, and the first process
+
+The machine now boots into userspace. The kernel finishes initialising, reads
+`sh.elf` off the same filesystem as anything else, and runs it as the first
+process — with no privilege the other programs lack, waited for exactly as any
+parent waits for any child. Everything after that descends from it. If it cannot
+start or it exits, you land back in the kernel shell, which a real machine would
+call a panic.
+
+Arguments arrive as one buffer of zero-separated strings and a count, because
+every pointer in an array of them would be an address in a space `exec` is about
+to destroy. The kernel copies them into its own memory, builds the new address
+space, and writes them onto the new stack — then hands `_start` a count and an
+array of pointers ending in null, which is the shape every C program has expected
+since 1972.
+
+`argv[0]` is the program's own name. Nothing requires that; it is a convention,
+and it is the reason a program can behave differently depending on what it was
+called.
 
 ---
 
@@ -1237,9 +1257,10 @@ because reading it is the point.
 - **No argv or environment.** `exec` takes a filename and nothing else.
 - **One terminal, no job control.** Whichever process reads the console gets the
   next keystroke. No foreground process group, no Ctrl-C, no background jobs.
-- **The kernel shell is still there**, and is still the thing that starts the
-  user shell. A real system's first process *is* userspace; here `exec sh.elf`
-  is a command you type.
+- **The kernel shell is still there as a fallback.** If init cannot start or
+  exits, you land in it. A real machine calls that a panic.
+- **No environment variables, and no `PATH`.** A command is a filename in the
+  root directory.
 - **No argv, no environment, no file descriptors.** `exec` takes a filename and
   nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through

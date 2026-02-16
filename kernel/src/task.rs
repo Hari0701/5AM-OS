@@ -733,7 +733,13 @@ pub fn reset_counter() {
 ///
 /// # Safety
 /// `top` must be the 16-aligned top of a stack with room for the frame.
-pub unsafe fn build_user_frame(top: u64, entry: u64, user_stack: u64) -> u64 {
+pub unsafe fn build_user_frame(
+    top: u64,
+    entry: u64,
+    user_stack: u64,
+    argc: u64,
+    argv: u64,
+) -> u64 {
     let mut sp = top;
     let mut push = |value: u64| {
         sp -= 8;
@@ -746,9 +752,22 @@ pub unsafe fn build_user_frame(top: u64, entry: u64, user_stack: u64) -> u64 {
     push(gdt::USER_CODE as u64); // CS -- RPL 3 is what performs the transition
     push(entry);                 // RIP
 
-    // Fifteen registers, all zero. A fresh program has no history.
-    for _ in 0..15 {
-        push(0);
+    // Fifteen registers. All zero except the two carrying the arguments --
+    // a fresh program has no history, but it does have a name and a reason.
+    //
+    // Pushed rax first, so the pop order (r15 downwards) makes RDI the eighth
+    // from the bottom and RSI the ninth. Real ELF hands argv to _start on the
+    // stack; registers are simpler to see and just as honest, as long as both
+    // sides agree -- which is all a calling convention ever is.
+    push(0); // rax
+    push(0); // rcx
+    push(0); // rdx
+    push(0); // rbx
+    push(0); // rbp
+    push(argv); // rsi
+    push(argc); // rdi
+    for _ in 0..8 {
+        push(0); // r8..r15
     }
     sp
 }
@@ -764,6 +783,8 @@ pub fn spawn_user(
     user_stack: u64,
     root: u64,
     parent: Option<usize>,
+    argc: u64,
+    argv: u64,
 ) -> Result<usize, &'static str> {
     without_interrupts(|| {
         let tasks = tasks();
@@ -773,7 +794,7 @@ pub fn spawn_user(
 
         let stack: Box<[u8]> = vec![0u8; STACK_SIZE].into_boxed_slice();
         let top = (stack.as_ptr() as u64 + STACK_SIZE as u64) & !0xF;
-        let stack_pointer = unsafe { build_user_frame(top, entry, user_stack) };
+        let stack_pointer = unsafe { build_user_frame(top, entry, user_stack, argc, argv) };
 
         let task = &mut tasks[id];
         task.state = State::Ready;

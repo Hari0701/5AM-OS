@@ -15,6 +15,8 @@
 //! is a smaller one than this was: `load()` already takes a byte slice and does
 //! not care where it came from.
 
+extern crate alloc;
+
 use crate::memory::{self, PAGE_SIZE};
 use crate::println;
 use crate::{elf, syscall};
@@ -33,6 +35,38 @@ pub fn embedded_program() -> &'static [u8] {
     PROGRAM
 }
 
+/// Start `sh.elf` as the first user process, and wait for it.
+///
+/// Everything a running system does descends from one program the kernel
+/// starts by hand. Here that is the shell, read off the same filesystem as
+/// anything else, given no privilege the other programs lack, and waited for
+/// exactly as any parent waits for any child.
+pub fn start_init() {
+    let Ok(volume) = crate::fat::mount() else {
+        println!("[init] no disk -- falling back to the kernel shell");
+        println!();
+        return;
+    };
+    let program = match volume
+        .find("sh.elf")
+        .and_then(|entry| volume.read_file(&entry))
+    {
+        Ok(data) => data,
+        Err(error) => {
+            println!("[init] sh.elf: {error} -- falling back to the kernel shell");
+            println!();
+            return;
+        }
+    };
+
+    println!("[init] starting sh.elf as the first user process");
+    run_bytes_named(&program, "init", false);
+    println!();
+    println!("[init] the first process exited. The kernel shell is the fallback;");
+    println!("       a real machine would call this a panic.");
+    println!();
+}
+
 /// Run the copy of the program that was built into the kernel image.
 pub fn run() {
     println!("  The program is a {} byte ELF file, built separately.", PROGRAM.len());
@@ -44,6 +78,10 @@ pub fn run() {
 /// `load()` takes a byte slice and does not care where it came from, which is
 /// the whole reason `exec` needed nothing new from this module.
 pub fn run_bytes(program: &[u8]) {
+    run_bytes_named(program, "prog", true)
+}
+
+pub fn run_bytes_named(program: &[u8], name: &str, verbose: bool) {
     // A private address space, so this program cannot see any other one's
     // memory -- which until now it could, because every task shared a single
     // set of page tables and ring 3 only fenced userspace off from the kernel.
@@ -57,10 +95,12 @@ pub fn run_bytes(program: &[u8]) {
     // the copies go to the right place. Safe because the kernel is mapped
     // identically in both -- see AddressSpace for why that is not optional.
     unsafe { space.activate() };
-    println!("  Private address space at {:#x}.", space.root());
-    println!("  Reading its program headers:");
+    if verbose {
+        println!("  Private address space at {:#x}.", space.root());
+        println!("  Reading its program headers:");
+    }
 
-    let loaded = match unsafe { elf::load(program, true) } {
+    let loaded = match unsafe { elf::load(program, verbose) } {
         Ok(loaded) => loaded,
         Err(error) => {
             println!("  refusing to run it: {error}");
@@ -70,10 +110,12 @@ pub fn run_bytes(program: &[u8]) {
         }
     };
 
-    println!(
-        "  {} segments loaded, {} bytes of fresh zeroed memory.",
-        loaded.segments, loaded.bytes_zeroed
-    );
+    if verbose {
+        println!(
+            "  {} segments loaded, {} bytes of fresh zeroed memory.",
+            loaded.segments, loaded.bytes_zeroed
+        );
+    }
 
     let Some(stack_top) = map_stack() else {
         println!("  could not map the user stack");
@@ -81,10 +123,12 @@ pub fn run_bytes(program: &[u8]) {
         unsafe { space.destroy() };
         return;
     };
-    println!(
-        "  stack     {USER_STACK_ADDRESS:#010x}  {} bytes, rw-, mapped by the kernel",
-        USER_STACK_PAGES * PAGE_SIZE as u64
-    );
+    if verbose {
+        println!(
+            "  stack     {USER_STACK_ADDRESS:#010x}  {} bytes, rw-, mapped by the kernel",
+            USER_STACK_PAGES * PAGE_SIZE as u64
+        );
+    }
 
     let before = syscall::count();
     let root = space.root();
@@ -98,7 +142,9 @@ pub fn run_bytes(program: &[u8]) {
     // shared a single kernel stack. Now a user program is a task with an
     // address space, the scheduler switches to it like anything else, and the
     // shell simply waits for it the same way it waits for a kernel task.
-    let id = match crate::task::spawn_user("prog", loaded.entry, stack_top - 8, root, Some(0)) {
+    let arguments = [alloc::string::String::from(name)];
+    let (stack, argc, argv) = place_arguments(stack_top, &arguments);
+    let id = match crate::task::spawn_user(name, loaded.entry, stack, root, Some(0), argc, argv) {
         Ok(id) => id,
         Err(error) => {
             println!("  could not start it: {error}");
@@ -112,9 +158,11 @@ pub fn run_bytes(program: &[u8]) {
     // program's when it runs it.
     unsafe { memory::activate_root(kernel_root) };
 
-    println!();
-    println!("  Task {id} is now running it in ring 3.");
-    println!();
+    if verbose {
+        println!();
+        println!("  Task {id} is now running it in ring 3.");
+        println!();
+    }
 
     let code = crate::task::wait_any_child(0);
 
@@ -125,12 +173,53 @@ pub fn run_bytes(program: &[u8]) {
     }
     crate::task::reap_finished();
 
-    println!();
-    match code {
-        Some(code) => println!("  Task {id} exited with {code}."),
-        None => println!("  Task {id} is gone."),
+    if verbose {
+        println!();
+        match code {
+            Some(code) => println!("  Task {id} exited with {code}."),
+            None => println!("  Task {id} is gone."),
+        }
+        println!("  {} syscalls, {freed} frames returned.", syscall::count() - before);
     }
-    println!("  {} syscalls, {freed} frames returned.", syscall::count() - before);
+}
+
+/// Copy argument strings onto the top of a user stack.
+///
+/// The strings themselves have to *be* in the new address space -- the shell's
+/// copies are in memory this program will never see. So they are carried across
+/// in kernel memory and written out here, once the new space is active.
+///
+/// Returns the stack pointer to start with, the count, and the address of the
+/// pointer array. What comes back is the shape every C program has expected
+/// since 1972: `argc`, and an array of pointers ending in null.
+pub fn place_arguments(stack_top: u64, arguments: &[alloc::string::String]) -> (u64, u64, u64) {
+    let mut cursor = stack_top;
+    let mut addresses = alloc::vec::Vec::with_capacity(arguments.len());
+
+    for argument in arguments {
+        cursor -= argument.len() as u64 + 1;
+        cursor &= !0x7;
+        unsafe {
+            core::ptr::copy_nonoverlapping(argument.as_ptr(), cursor as *mut u8, argument.len());
+            // The terminating zero is not decoration: it is the only thing that
+            // tells the program where the string ends.
+            *((cursor + argument.len() as u64) as *mut u8) = 0;
+        }
+        addresses.push(cursor);
+    }
+
+    cursor -= (addresses.len() as u64 + 1) * 8;
+    cursor &= !0xF;
+    let argv = cursor;
+    for (index, address) in addresses.iter().enumerate() {
+        unsafe { *((argv + (index * 8) as u64) as *mut u64) = *address };
+    }
+    // The null that ends the array, so a program can walk it without being told
+    // how long it is.
+    unsafe { *((argv + (addresses.len() * 8) as u64) as *mut u64) = 0 };
+
+    let stack = (argv - 64) & !0xF;
+    (stack - 8, addresses.len() as u64, argv)
 }
 
 /// Map a fresh stack into the active address space, returning its top.

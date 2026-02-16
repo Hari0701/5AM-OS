@@ -126,9 +126,47 @@ fn equals(bytes: &[u8], text: &str) -> bool {
     bytes == text.as_bytes()
 }
 
-/// Replace this process with `name`. Only returns if that failed.
-fn exec(name: &[u8]) {
-    unsafe { syscall(SYS_EXEC, name.as_ptr() as u64, name.len() as u64, 0) };
+static mut BLOB: [u8; 256] = [0; 256];
+
+/// Replace this process with the program named by the first word.
+///
+/// The arguments go across as one buffer of zero-separated strings, because
+/// every pointer in an array of them would be an address in a space `exec` is
+/// about to destroy. Only returns if the exec failed.
+fn exec(command: &[u8]) {
+    let mut length = 0usize;
+    let mut count = 0u64;
+    let mut index = 0usize;
+
+    while index < command.len() {
+        while index < command.len() && command[index] == b' ' {
+            index += 1;
+        }
+        if index >= command.len() {
+            break;
+        }
+        let start = index;
+        while index < command.len() && command[index] != b' ' {
+            index += 1;
+        }
+        for &byte in &command[start..index] {
+            if length < 255 {
+                unsafe { BLOB[length] = byte };
+                length += 1;
+            }
+        }
+        if length < 255 {
+            unsafe { BLOB[length] = 0 };
+            length += 1;
+        }
+        count += 1;
+    }
+
+    if count == 0 {
+        return;
+    }
+    let pointer = unsafe { core::ptr::addr_of!(BLOB) as u64 };
+    unsafe { syscall(SYS_EXEC, pointer, length as u64, count) };
 }
 
 /// Run one command and wait for it.

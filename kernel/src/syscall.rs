@@ -130,7 +130,7 @@ extern "C" fn dispatch(
 
         SYS_FORK => fork(context),
 
-        SYS_EXEC => exec(arg0, arg1, context),
+        SYS_EXEC => exec(arg0, arg1, arg2, context),
 
         SYS_WAIT => {
             let id = crate::task::current_id();
@@ -294,20 +294,40 @@ fn fork(context: *mut u64) -> u64 {
 /// from**: new entry point, new stack, registers zeroed. `syscall_entry` then
 /// pops that frame and `iretq`s exactly as it always would, and lands somewhere
 /// else entirely.
-fn exec(path: u64, length: u64, context: *mut u64) -> u64 {
-    if !memory::is_user_accessible(path, length) || length > 64 {
-        println!("  [syscall] exec: bad path pointer");
+fn exec(blob: u64, length: u64, count: u64, context: *mut u64) -> u64 {
+    // The arguments arrive as one buffer of zero-separated strings, with a
+    // count. One pointer instead of an array of them, because every pointer in
+    // an array would be an address in a space this call is about to destroy.
+    if !memory::is_user_accessible(blob, length) || length > 1024 || count == 0 || count > 16 {
+        println!("  [syscall] exec: bad arguments");
         return u64::MAX;
     }
-    let bytes = unsafe { core::slice::from_raw_parts(path as *const u8, length as usize) };
-    let Ok(borrowed) = core::str::from_utf8(bytes) else {
-        return u64::MAX;
-    };
-    // Copy it out of user memory now, while that memory still exists. This
-    // function is about to switch address spaces, and a &str held across that
-    // is a use-after-free with no free involved: the address stays valid and
+    let bytes = unsafe { core::slice::from_raw_parts(blob as *const u8, length as usize) };
+
+    // Copy every argument out of user memory now, while that memory still
+    // exists. Holding a &str across the address space switch is a
+    // use-after-free with no free involved: the address stays valid and
     // quietly starts meaning something else.
-    let name: alloc::string::String = borrowed.into();
+    let mut arguments: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for piece in bytes.split(|&b| b == 0) {
+        if arguments.len() as u64 >= count {
+            break;
+        }
+        if piece.is_empty() {
+            continue;
+        }
+        match core::str::from_utf8(piece) {
+            Ok(text) => arguments.push(text.into()),
+            Err(_) => return u64::MAX,
+        }
+    }
+    if arguments.is_empty() {
+        return u64::MAX;
+    }
+    // argv[0] names the program, which is a convention rather than a rule --
+    // the kernel could take the path separately, and then a program could not
+    // be told what it was invoked as.
+    let name = arguments[0].clone();
 
     let Ok(volume) = crate::fat::mount() else {
         println!("  [syscall] exec: no filesystem");
@@ -355,16 +375,22 @@ fn exec(path: u64, length: u64, context: *mut u64) -> u64 {
     core::mem::forget(fresh);
     unsafe { memory::AddressSpace::adopt(old_root).destroy() };
 
-    // Rewrite the frame this syscall is going to return through: fifteen zeroed
-    // registers, then RIP, CS, RFLAGS, RSP, SS.
+    // Write the arguments into the new space, now that it is the active one.
+    let (stack, argc, argv) = crate::user::place_arguments(stack_top, &arguments);
+
+    // Rewrite the frame this syscall is going to return through: fifteen
+    // registers, then RIP, CS, RFLAGS, RSP, SS. RDI and RSI carry argc and
+    // argv; the pop order puts them at indexes 8 and 9.
     unsafe {
         for index in 0..15 {
             *context.add(index) = 0;
         }
+        *context.add(8) = argc;
+        *context.add(9) = argv;
         *context.add(15) = loaded.entry;
         *context.add(16) = gdt::USER_CODE as u64;
         *context.add(17) = 0x202;
-        *context.add(18) = stack_top - 8;
+        *context.add(18) = stack;
         *context.add(19) = gdt::USER_DATA as u64;
     }
 
