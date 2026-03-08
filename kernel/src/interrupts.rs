@@ -360,6 +360,21 @@ extern "x86-interrupt" fn serial_irq(_frame: InterruptStackFrame) {
     unsafe {
         let console = &mut *core::ptr::addr_of_mut!(crate::serial::CONSOLE);
         while let Some(byte) = console.try_recv() {
+            // Ctrl-C is handled here, as it arrives, and never becomes data.
+            //
+            // The first version checked for it where a program *reads* the
+            // console, which cannot work: the program you most want to
+            // interrupt is the one not reading anything. Nobody drained the
+            // buffer, so the byte sat in it while the program spun. A terminal
+            // driver has always done this on receipt, and this is why.
+            if byte == 0x03 {
+                if let Some(target) = crate::task::foreground_user_task() {
+                    crate::task::signal(target, crate::signal::SIGINT);
+                    crate::println!();
+                    crate::println!("  [console] ^C -- SIGINT to task {target}");
+                }
+                continue;
+            }
             crate::serial::push_input(byte);
         }
         crate::task::wake_all(keyboard::INPUT_CHANNEL);

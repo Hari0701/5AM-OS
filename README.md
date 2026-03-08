@@ -143,6 +143,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | Pipes + file descriptors | working | End-of-file is a reference count, not a marker |
 | A shell in ring 3 | working | fork + exec + wait + pipe, and nothing else |
 | argv + init | working | The machine boots into userspace and stays there |
+| Signals | working | The kernel calling a function the program never called |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -1037,6 +1038,55 @@ called.
 
 ---
 
+### Signals
+
+Every other way the kernel touches a process is a reply — the process asks, the
+kernel answers. A signal is the other direction: the kernel forcing a detour
+through code the program never called, at a moment it did not choose.
+
+```
+$ catch.elf
+  catcher: looping. Press Ctrl-C.
+  catcher: still here
+  [console] ^C -- SIGINT to task 2
+  catcher: caught one. Two more and I stop catching.
+  [console] ^C -- SIGINT to task 2
+  catcher: caught two.
+  [console] ^C -- SIGINT to task 2
+  catcher: three. Next one is fatal -- handler removed.
+  [console] ^C -- SIGINT to task 2
+  [syscall] task 2 killed by a signal
+$
+```
+
+`catch.elf` makes no syscalls in its loop. The only reason it can be reached at
+all is that the timer already takes the CPU away from ring 3.
+
+**The whole trick is stacks.** There is no way to *call* a function in a process
+that is not running, so the kernel does not call anything. It waits until the
+process is about to resume — returning from a syscall, or being picked by the
+scheduler — and rewrites the trap frame it will resume through. First it pushes
+that whole frame onto the program's own stack, then a return address below it,
+then sets RIP to the handler and RDI to the signal number.
+
+The program resumes inside a function it never called. When that function
+returns, it lands on a **restorer** — four instructions, visible in
+[`userland/src/catcher.rs`](userland/src/catcher.rs), that ask the kernel to put
+everything back. Linux keeps the same stub in the vDSO; here the program
+supplies it, which seems fairer in a kernel you are meant to read.
+
+Nothing is remembered on the kernel side at all. `sigreturn` needs no argument
+because the saved frame is exactly where the user's stack pointer already
+points — which is also why handlers can nest.
+
+**The bug worth keeping.** The first version checked for Ctrl-C where a program
+*reads* the console. That cannot work: the program you most want to interrupt is
+the one not reading anything. The byte sat in a buffer while the program spun,
+and nothing happened. A terminal driver has always tested for it on arrival, and
+this is why.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1255,8 +1305,11 @@ because reading it is the point.
   spaces — they just take turns, because ring 3 is still not preemptible.
 - **No signals, no shared memory.** Pipes are the only IPC.
 - **No argv or environment.** `exec` takes a filename and nothing else.
-- **One terminal, no job control.** Whichever process reads the console gets the
-  next keystroke. No foreground process group, no Ctrl-C, no background jobs.
+- **No process groups.** Ctrl-C goes to the youngest live user task, which is a
+  stand-in for a foreground process group — that needs sessions and terminals
+  this kernel does not have. No background jobs, no `SIGTSTP`.
+- **Signals are one bit each.** No masking, no queueing, no `sigaction` flags:
+  two of the same signal collapse into one, which real signals also do.
 - **The kernel shell is still there as a fallback.** If init cannot start or
   exits, you land in it. A real machine calls that a panic.
 - **No environment variables, and no `PATH`.** A command is a filename in the

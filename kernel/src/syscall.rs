@@ -76,6 +76,9 @@ pub const SYS_PIPE: u64 = 6;
 pub const SYS_READ: u64 = 7;
 pub const SYS_CLOSE: u64 = 8;
 pub const SYS_DUP2: u64 = 9;
+pub const SYS_KILL: u64 = 10;
+pub const SYS_SIGNAL: u64 = 11;
+pub const SYS_SIGRETURN: u64 = 12;
 
 /// How many syscalls have crossed the boundary, for the shell.
 static mut COUNT: u64 = 0;
@@ -115,6 +118,26 @@ extern "C" fn dispatch(
     crate::interrupts::enable();
     unsafe { COUNT += 1 };
 
+    let result = handle(number, arg0, arg1, arg2, context);
+
+    // Deliver on the way back to ring 3. This is the moment a signal becomes
+    // real: the frame about to be resumed through is rewritten to enter the
+    // handler instead.
+    let id = crate::task::current_id();
+    if crate::task::has_pending_signal(id) {
+        if unsafe { crate::signal::deliver(id, context) } {
+            let signal = 128;
+            println!("  [syscall] task {id} killed by a signal");
+            crate::task::finish(id, signal);
+            loop {
+                crate::task::yield_now();
+            }
+        }
+    }
+    result
+}
+
+fn handle(number: u64, arg0: u64, arg1: u64, arg2: u64, context: *mut u64) -> u64 {
     match number {
         SYS_EXIT => {
             let id = crate::task::current_id();
@@ -165,6 +188,35 @@ extern "C" fn dispatch(
             } else {
                 u64::MAX
             }
+        }
+
+        // kill(pid, signal): the only way one process reaches another without
+        // the other having asked for anything.
+        SYS_KILL => {
+            let target = arg0 as usize;
+            if crate::task::signal(target, arg1 as usize) {
+                println!("  [syscall] signal {} sent to task {target}", arg1);
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        // signal(number, handler, restorer)
+        SYS_SIGNAL => {
+            let id = crate::task::current_id();
+            if crate::task::set_signal_handler(id, arg0 as usize, arg1, arg2) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        // Put back what the handler interrupted. Never returns a value: the
+        // whole frame, RAX included, is overwritten from the user's stack.
+        SYS_SIGRETURN => {
+            unsafe { crate::signal::restore(context) };
+            unsafe { *context.add(14) }
         }
 
         SYS_CLOSE => {
@@ -371,6 +423,8 @@ fn exec(blob: u64, length: u64, count: u64, context: *mut u64) -> u64 {
     };
 
     let id = crate::task::current_id();
+    // The handlers pointed into a program that no longer exists.
+    crate::task::clear_signal_handlers(id);
     crate::task::set_address_space(id, fresh.root());
     core::mem::forget(fresh);
     unsafe { memory::AddressSpace::adopt(old_root).destroy() };

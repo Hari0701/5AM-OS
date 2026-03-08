@@ -119,6 +119,14 @@ pub struct Task {
     /// noticing. That indirection is the whole reason a shell can redirect
     /// anything into anything.
     pub files: [Descriptor; MAX_FILES],
+    /// One bit per signal. A bit, not a queue -- two of the same signal
+    /// arriving before either is delivered collapse into one, which is true of
+    /// real signals too and the reason they carry no data.
+    pub pending: u32,
+    pub handlers: [u64; crate::signal::MAX_SIGNALS],
+    /// The few instructions a handler returns through. Supplied by the program
+    /// because this kernel has no vDSO to keep them in.
+    pub restorer: u64,
 }
 
 pub const MAX_FILES: usize = 8;
@@ -172,6 +180,9 @@ impl Task {
             kernel_stack_top: 0,
             work: None,
             files: [Descriptor::Free; MAX_FILES],
+            pending: 0,
+            handlers: [0; crate::signal::MAX_SIGNALS],
+            restorer: 0,
         }
     }
 
@@ -439,6 +450,38 @@ extern "C" fn schedule(stack_pointer: u64) -> u64 {
             crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top);
         }
     }
+    // Deliver to the task about to resume. A program that loops without ever
+    // calling anything would otherwise be unreachable -- which is exactly the
+    // program you most want to be able to interrupt.
+    //
+    // Safe here because the address space above is already the one whose user
+    // stack the handler frame gets written to.
+    if tasks[next].address_space.is_some() && tasks[next].pending != 0 {
+        let frame = tasks[next].stack_pointer as *mut u64;
+        if unsafe { crate::signal::deliver(next, frame) } {
+            tasks[next].exit_code = 128;
+            tasks[next].state = State::Finished;
+            wake_all(next as u64);
+            // It cannot be resumed now, so fall back to whatever else can run.
+            let mut fallback = 0;
+            for offset in 1..=MAX_TASKS {
+                let candidate = (next + offset) % MAX_TASKS;
+                if tasks[candidate].state == State::Ready {
+                    fallback = candidate;
+                    break;
+                }
+            }
+            unsafe { CURRENT = fallback };
+            if let Some(root) = tasks[fallback].address_space {
+                unsafe { crate::memory::activate_root(root) };
+            }
+            if tasks[fallback].kernel_stack_top != 0 {
+                crate::gdt::set_kernel_stack(tasks[fallback].kernel_stack_top);
+            }
+            return tasks[fallback].stack_pointer;
+        }
+    }
+
     tasks[next].stack_pointer
 }
 
@@ -834,6 +877,8 @@ pub fn spawn_user(
 /// in RAX. Because both are now saved in the same format, that is a memcpy and
 /// one store.
 pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &'static str> {
+    let parent_handlers = tasks()[parent].handlers;
+    let parent_restorer = tasks()[parent].restorer;
     without_interrupts(|| {
         let tasks = tasks();
         let id = (1..MAX_TASKS)
@@ -869,6 +914,11 @@ pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &
         // no more data only when the last writer is gone, so a child that
         // inherits a write end and never closes it hangs the reader forever.
         task.files = tasks_files(parent);
+        // Handlers are inherited: the child is running the same program, so the
+        // same addresses mean the same code.
+        task.handlers = parent_handlers;
+        task.restorer = parent_restorer;
+        task.pending = 0;
         for descriptor in task.files.iter() {
             match descriptor {
                 Descriptor::PipeRead(id) => crate::pipe::add_reader(*id),
@@ -1071,4 +1121,97 @@ pub fn orphan_address_spaces() -> Vec<u64> {
         }
         core::mem::take(orphans())
     })
+}
+
+// --- signals -------------------------------------------------------------
+
+/// Mark a signal pending, and wake the task if it is asleep.
+///
+/// Waking matters as much as the bit. A task blocked forever on an empty pipe
+/// has to become runnable to notice anything at all -- which is why a signal
+/// makes a blocking read return early on every real system.
+pub fn signal(id: usize, number: usize) -> bool {
+    if id >= MAX_TASKS || number >= crate::signal::MAX_SIGNALS {
+        return false;
+    }
+    let woken = without_interrupts(|| {
+        let task = &mut tasks()[id];
+        if task.state == State::Free || task.state == State::Finished {
+            return false;
+        }
+        task.pending |= 1 << number;
+        if matches!(task.state, State::Blocked(_)) {
+            task.state = State::Ready;
+        }
+        true
+    });
+    woken
+}
+
+pub fn take_pending_signal(id: usize) -> Option<usize> {
+    without_interrupts(|| {
+        let task = &mut tasks()[id];
+        if task.pending == 0 {
+            return None;
+        }
+        let number = task.pending.trailing_zeros() as usize;
+        task.pending &= !(1 << number);
+        Some(number)
+    })
+}
+
+pub fn set_pending_signal(id: usize, number: usize) {
+    without_interrupts(|| tasks()[id].pending |= 1 << number)
+}
+
+pub fn has_pending_signal(id: usize) -> bool {
+    tasks()[id].pending != 0
+}
+
+pub fn signal_handler(id: usize, number: usize) -> u64 {
+    if number >= crate::signal::MAX_SIGNALS {
+        return 0;
+    }
+    tasks()[id].handlers[number]
+}
+
+pub fn signal_restorer(id: usize) -> u64 {
+    tasks()[id].restorer
+}
+
+pub fn set_signal_handler(id: usize, number: usize, handler: u64, restorer: u64) -> bool {
+    if number >= crate::signal::MAX_SIGNALS || !crate::signal::catchable(number) {
+        return false;
+    }
+    without_interrupts(|| {
+        tasks()[id].handlers[number] = handler;
+        tasks()[id].restorer = restorer;
+    });
+    true
+}
+
+/// Forget every handler: `exec` replaced the code they pointed at.
+pub fn clear_signal_handlers(id: usize) {
+    without_interrupts(|| {
+        tasks()[id].handlers = [0; crate::signal::MAX_SIGNALS];
+        tasks()[id].restorer = 0;
+    })
+}
+
+/// The task a Ctrl-C should go to.
+///
+/// A real system sends it to the foreground *process group*, which needs
+/// sessions and terminals this kernel does not have. The youngest live user
+/// task is a decent stand-in: it is the thing the shell most recently started,
+/// which is what you meant.
+pub fn foreground_user_task() -> Option<usize> {
+    let tasks = tasks();
+    (1..MAX_TASKS).rev().find(|&id| {
+        tasks[id].address_space.is_some()
+            && !matches!(tasks[id].state, State::Free | State::Finished)
+    })
+}
+
+pub fn is_user_task(id: usize) -> bool {
+    id < MAX_TASKS && tasks()[id].address_space.is_some()
 }
