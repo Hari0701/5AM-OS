@@ -127,6 +127,14 @@ pub struct Task {
     /// The few instructions a handler returns through. Supplied by the program
     /// because this kernel has no vDSO to keep them in.
     pub restorer: u64,
+    /// The region the stack may grow into, and where it currently reaches.
+    ///
+    /// Only the top page is mapped when a program starts. The rest is a
+    /// promise: an address the kernel has agreed to make real if the program
+    /// ever touches it. That promise is what demand paging *is*.
+    pub stack_top: u64,
+    pub stack_limit: u64,
+    pub stack_faults: u64,
 }
 
 pub const MAX_FILES: usize = 8;
@@ -183,6 +191,9 @@ impl Task {
             pending: 0,
             handlers: [0; crate::signal::MAX_SIGNALS],
             restorer: 0,
+            stack_top: 0,
+            stack_limit: 0,
+            stack_faults: 0,
         }
     }
 
@@ -879,6 +890,7 @@ pub fn spawn_user(
 pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &'static str> {
     let parent_handlers = tasks()[parent].handlers;
     let parent_restorer = tasks()[parent].restorer;
+    let parent_stack = (tasks()[parent].stack_top, tasks()[parent].stack_limit);
     without_interrupts(|| {
         let tasks = tasks();
         let id = (1..MAX_TASKS)
@@ -919,6 +931,9 @@ pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &
         task.handlers = parent_handlers;
         task.restorer = parent_restorer;
         task.pending = 0;
+        task.stack_top = parent_stack.0;
+        task.stack_limit = parent_stack.1;
+        task.stack_faults = 0;
         for descriptor in task.files.iter() {
             match descriptor {
                 Descriptor::PipeRead(id) => crate::pipe::add_reader(*id),
@@ -1214,4 +1229,33 @@ pub fn foreground_user_task() -> Option<usize> {
 
 pub fn is_user_task(id: usize) -> bool {
     id < MAX_TASKS && tasks()[id].address_space.is_some()
+}
+
+// --- demand-paged stacks -------------------------------------------------
+
+/// Record the region this task's stack may grow into.
+pub fn set_stack_region(id: usize, top: u64, limit: u64) {
+    without_interrupts(|| {
+        let task = &mut tasks()[id];
+        task.stack_top = top;
+        task.stack_limit = limit;
+        task.stack_faults = 0;
+    })
+}
+
+pub fn stack_region(id: usize) -> (u64, u64) {
+    let task = &tasks()[id];
+    (task.stack_top, task.stack_limit)
+}
+
+pub fn note_stack_fault(id: usize) -> u64 {
+    without_interrupts(|| {
+        let task = &mut tasks()[id];
+        task.stack_faults += 1;
+        task.stack_faults
+    })
+}
+
+pub fn stack_faults(id: usize) -> u64 {
+    tasks()[id].stack_faults
 }

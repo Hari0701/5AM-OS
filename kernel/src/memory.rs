@@ -938,6 +938,48 @@ pub unsafe fn cow_fault(address: u64) -> bool {
     true
 }
 
+/// Make good on an address the kernel promised but never mapped.
+///
+/// This is the fault that is not an error. A program touches a page inside its
+/// stack region that was never backed by anything; the kernel allocates a
+/// frame, maps it, and returns. The faulting instruction runs again and
+/// succeeds, and the program never learns that anything happened.
+///
+/// It is the whole idea behind every large allocation you have ever made
+/// returning instantly: the memory is not there, it is *promised*, and the
+/// promise costs a page table entry rather than a page.
+///
+/// # Safety
+/// Called from the page fault handler, with the faulting task's address space
+/// active.
+pub unsafe fn demand_fault(address: u64) -> Option<u64> {
+    let id = crate::task::current_id();
+    let (top, limit) = crate::task::stack_region(id);
+    if top == 0 || address >= top {
+        return None;
+    }
+
+    let page = address & !(PAGE_SIZE as u64 - 1);
+    if page < limit {
+        // Below the limit is the guard: not a promise, and deliberately never
+        // mapped. Without it a runaway stack would silently grow into whatever
+        // is underneath and corrupt it instead of stopping.
+        return None;
+    }
+    if translate(page).is_some() {
+        return None;
+    }
+
+    let frame = allocator().allocate()?;
+    unsafe {
+        map_page(page, frame, FLAG_USER | WRITABLE).ok()?;
+        // Zero it, for the same reason `.bss` is zeroed: this frame held
+        // somebody else's data a moment ago.
+        core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+    }
+    Some(page)
+}
+
 /// Is this frame shared with another address space?
 pub fn is_shared(frame: u64) -> bool {
     share_count(frame) > 1

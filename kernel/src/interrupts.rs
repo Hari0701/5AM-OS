@@ -296,6 +296,22 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
         }
     }
 
+    // A page that was never mapped, inside a region the kernel promised. This
+    // is the fault that is not an error, and the one this handler has been
+    // describing since the first week without ever acting on it.
+    if error & PRESENT == 0 {
+        if let Some(page) = unsafe { crate::memory::demand_fault(address) } {
+            let id = crate::task::current_id();
+            let count = crate::task::note_stack_fault(id);
+            // Quiet after the first few: the interesting thing is that it
+            // happens at all, not that it keeps happening.
+            if count <= 3 {
+                println!("  [page] grew task {id}'s stack to {page:#x} (fault {count})");
+            }
+            return;
+        }
+    }
+
     // Everything past here is fatal, so take the console by force rather than
     // waiting on a lock whose holder may be the code that just faulted.
     unsafe { crate::serial::force_unlock_console() };

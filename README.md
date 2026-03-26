@@ -144,6 +144,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | A shell in ring 3 | working | fork + exec + wait + pipe, and nothing else |
 | argv + init | working | The machine boots into userspace and stays there |
 | Signals | working | The kernel calling a function the program never called |
+| Demand paging | working | The fault that is not an error |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -1087,6 +1088,51 @@ this is why.
 
 ---
 
+### Demand paging
+
+The page fault handler has been saying the same thing since the first week: *a
+real kernel would map a page here and return*. It never did. It printed a
+beautiful explanation and stopped the machine.
+
+Now one kind of fault is not an error at all.
+
+```
+$ deep.elf
+  deep: started with one page of stack. Recursing.
+  [page] grew task 2's stack to 0x10e000 (fault 1)
+  [page] grew task 2's stack to 0x10d000 (fault 2)
+  [page] grew task 2's stack to 0x10c000 (fault 3)
+  deep: 16 levels down
+  deep: 32 levels down
+  deep: 48 levels down
+  deep: came back up. Every frame below the first page was
+        a page the kernel made real while I was running.
+```
+
+A program starts with **one page** of stack mapped. Everything below it is a
+promise — a range the kernel has agreed to make real if the program ever reaches
+it. Each frame that crosses a page boundary faults, and the handler allocates,
+maps, zeroes, and returns. The faulting instruction runs again and succeeds, and
+the program never learns that anything happened.
+
+That is why asking for a large stack costs nothing until it is used, and why a
+process can be given far more address space than the machine has memory. The
+promise costs a range in a table; only the keeping of it costs a page.
+
+**Below the limit is a guard**, deliberately never mapped. The first version of
+this demo recursed straight through the bottom of its region and got the ordinary
+fatal fault, which is exactly right — without a guard, a runaway stack grows
+silently into whatever is underneath instead of stopping.
+
+**And a note on the test.** The first run produced no faults at all, because the
+compiler had noticed that only two bytes of my kilobyte scratch array were ever
+read and shrank the frames to a few words. A perfectly good optimisation that
+completely defeated the program. Volatile stores across the whole array fixed
+it — the measurement had to be made harder to optimise away before it measured
+anything.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1305,6 +1351,8 @@ because reading it is the point.
   spaces — they just take turns, because ring 3 is still not preemptible.
 - **No signals, no shared memory.** Pipes are the only IPC.
 - **No argv or environment.** `exec` takes a filename and nothing else.
+- **Demand paging is stacks only.** Program text and data are still loaded
+  eagerly, and there is no swapping: a page that has been made real stays real.
 - **No process groups.** Ctrl-C goes to the youngest live user task, which is a
   stand-in for a foreground process group — that needs sessions and terminals
   this kernel does not have. No background jobs, no `SIGTSTP`.

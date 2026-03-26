@@ -26,8 +26,10 @@ static PROGRAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user.elf"));
 
 /// Where the user stack goes. Below the load address in `userland/link.ld`, so
 /// growing down moves it away from the program rather than into it.
-const USER_STACK_ADDRESS: u64 = 0x10_0000;
-const USER_STACK_PAGES: u64 = 4;
+const USER_STACK_TOP: u64 = 0x11_0000;
+/// How far down the stack may grow. Below this is a guard: never mapped, so a
+/// runaway stack stops rather than quietly eating whatever is underneath.
+const USER_STACK_LIMIT: u64 = 0x0D_0000;
 
 /// The program baked into the kernel image, for tests that need a known-good
 /// ELF without a disk.
@@ -125,8 +127,7 @@ pub fn run_bytes_named(program: &[u8], name: &str, verbose: bool) {
     };
     if verbose {
         println!(
-            "  stack     {USER_STACK_ADDRESS:#010x}  {} bytes, rw-, mapped by the kernel",
-            USER_STACK_PAGES * PAGE_SIZE as u64
+            "  stack     {USER_STACK_LIMIT:#010x}..{USER_STACK_TOP:#010x}  one page mapped, the rest promised",
         );
     }
 
@@ -227,18 +228,27 @@ pub fn place_arguments(stack_top: u64, arguments: &[alloc::string::String]) -> (
 /// No program header ever asks for a stack. Every process on every operating
 /// system gets one it never requested, and this is where that happens here.
 /// `exec` calls it again for the replacement program.
+/// Map the *top* page of a user stack and promise the rest.
+///
+/// One page, not sixteen. The other fifteen exist only as a range the kernel
+/// has agreed to make real if the program reaches them -- which is why a
+/// program with a deep call chain costs pages only when it actually recurses,
+/// and why every process can be given a large stack without any of them
+/// spending it.
 pub fn map_stack() -> Option<u64> {
-    for page in 0..USER_STACK_PAGES {
-        let address = USER_STACK_ADDRESS + page * PAGE_SIZE as u64;
-        if memory::translate(address).is_some() {
-            continue;
-        }
+    let first = USER_STACK_TOP - PAGE_SIZE as u64;
+    if memory::translate(first).is_none() {
         let frame = memory::allocator().allocate()?;
         let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
-        if unsafe { memory::map_page(address, frame, flags) }.is_err() {
+        if unsafe { memory::map_page(first, frame, flags) }.is_err() {
             return None;
         }
-        unsafe { core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE) };
+        unsafe { core::ptr::write_bytes(first as *mut u8, 0, PAGE_SIZE) };
     }
-    Some(USER_STACK_ADDRESS + USER_STACK_PAGES * PAGE_SIZE as u64)
+    crate::task::set_stack_region(
+        crate::task::current_id(),
+        USER_STACK_TOP,
+        USER_STACK_LIMIT,
+    );
+    Some(USER_STACK_TOP)
 }

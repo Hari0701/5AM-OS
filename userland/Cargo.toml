@@ -56,6 +56,10 @@ path = "src/echo.rs"
 name = "catcher"
 path = "src/catcher.rs"
 
+[[bin]]
+name = "deep"
+path = "src/deep.rs"
+
 [profile.release]
 panic = "abort"
 # Smaller is better here: every byte gets copied into a user page by hand.
