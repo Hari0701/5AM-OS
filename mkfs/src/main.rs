@@ -30,7 +30,12 @@ const SECTORS_PER_CLUSTER: usize = 4;
 const RESERVED_SECTORS: usize = 1;
 const FAT_COUNT: usize = 2;
 const ROOT_ENTRIES: usize = 512;
-const TOTAL_SECTORS: usize = 32768; // 16 MiB
+const TOTAL_SECTORS: usize = 32768; // 16 MiB of filesystem
+/// Sectors past the end of the volume, which the filesystem knows nothing
+/// about. The kernel uses them as swap: raw blocks, no structure, addressed by
+/// number. A real system uses a partition for exactly this reason -- swap has
+/// no filenames and no directories, so a filesystem would only be in the way.
+const SWAP_SECTORS: usize = 16384; // 8 MiB
 const SECTORS_PER_FAT: usize = 32;
 
 const ROOT_SECTORS: usize = ROOT_ENTRIES * 32 / SECTOR;
@@ -64,9 +69,10 @@ fn main() {
 
     let clusters = (TOTAL_SECTORS - DATA_START) / SECTORS_PER_CLUSTER;
     println!(
-        "{}: FAT16, {} KiB, {} clusters of {} bytes, {} file(s)",
+        "{}: FAT16 {} KiB + {} KiB swap, {} clusters of {} bytes, {} file(s)",
         output.display(),
-        image.len() / 1024,
+        TOTAL_SECTORS * SECTOR / 1024,
+        SWAP_SECTORS * SECTOR / 1024,
         clusters,
         SECTORS_PER_CLUSTER * SECTOR,
         files.len()
@@ -74,7 +80,7 @@ fn main() {
 }
 
 fn build(files: &[File]) -> Vec<u8> {
-    let mut image = vec![0u8; TOTAL_SECTORS * SECTOR];
+    let mut image = vec![0u8; (TOTAL_SECTORS + SWAP_SECTORS) * SECTOR];
 
     // A FAT16 volume must have between 4085 and 65524 clusters. Fewer and it is
     // a FAT12 volume by definition, more and it is FAT32 -- the "16" names the

@@ -35,6 +35,7 @@ mod serial;
 mod shell;
 mod signal;
 mod sync;
+mod swap;
 mod syscall;
 mod task;
 mod user;

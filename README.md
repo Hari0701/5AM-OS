@@ -145,6 +145,7 @@ ARM Mac is emulating x86 instruction by instruction.
 | argv + init | working | The machine boots into userspace and stays there |
 | Signals | working | The kernel calling a function the program never called |
 | Demand paging | working | The fault that is not an error |
+| Swapping | working | One hardware bit, and the clock that makes it enough |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
 
 ### Shell commands
@@ -1133,6 +1134,57 @@ anything.
 
 ---
 
+### Swapping
+
+Demand paging makes a page appear when it is touched. Swapping makes one
+disappear when it is not — and together they are why the memory a program can
+address stopped being limited by the memory the machine has.
+
+```
+5am> selftest swap
+  swapping
+    pass  evicting returns a frame     Some(534605824)
+    pass  one page is out on disk      1 of 4 swapped
+    pass  a slot is in use             1 slots, 1 evictions
+    pass  the same bytes come back     read 0xa000 and 0xa000, expected 0xa000
+    pass  and it is present again      mapped again at Some(534601728)
+    pass  no frames lost               125317 -> 125317
+```
+
+Those two middle lines are the whole claim: the page came back at a **different
+physical frame**, with the same contents. It went to a disk and returned, and
+the virtual address never changed — which is the entire point of having virtual
+addresses.
+
+**Where it goes.** Past the end of the filesystem. `mkfs` builds an image larger
+than the volume it describes, and everything after sector 32768 is unstructured
+blocks. That is what a swap partition is, and why it is a partition: swap has no
+names, no directories and no ordering, so a filesystem would be pure overhead.
+
+**Choosing the victim is the hard part.** The best page to evict is the one
+needed furthest in the future, which is unknowable — so every real algorithm
+guesses at "least recently used" from the little the hardware records. What it
+records is *one bit*: the CPU sets `accessed` whenever it translates through an
+entry, and never clears it.
+
+So: sweep the pages in a circle. At each one, either clear that bit and move on,
+or — if it is already clear — take the page. A page survives exactly as long as
+it keeps being touched between two passes of the hand. That is the clock
+algorithm, and it is in everything, because one bit is all anybody ever got.
+
+A swapped page keeps its entry. Present is cleared, a spare bit marks it, and
+the slot number goes where the frame number was — so every other flag, writable
+and user and no-execute, is still right when it comes back.
+
+**The bug worth keeping.** The first version walked the page tables into a
+snapshot and then tested *that* on every lap. The first lap clears accessed
+bits; the second lap re-read the stale copy, saw every page freshly used, and
+went round forever taking nothing. The clock depends on seeing the effect of its
+own previous pass — which is obvious once written down and invisible in code
+that reads a `Vec`.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1352,7 +1404,8 @@ because reading it is the point.
 - **No signals, no shared memory.** Pipes are the only IPC.
 - **No argv or environment.** `exec` takes a filename and nothing else.
 - **Demand paging is stacks only.** Program text and data are still loaded
-  eagerly, and there is no swapping: a page that has been made real stays real.
+  eagerly. Swapping applies to any user page, but nothing evicts on a timer —
+  only when a frame is wanted and none is free.
 - **No process groups.** Ctrl-C goes to the youngest live user task, which is a
   stand-in for a foreground process group — that needs sessions and terminals
   this kernel does not have. No background jobs, no `SIGTSTP`.

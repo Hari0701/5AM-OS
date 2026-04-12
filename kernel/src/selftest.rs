@@ -88,6 +88,10 @@ pub fn run(which: &str) {
         println!("  pipes");
         pipes(&mut report);
     }
+    if all || which == "swap" {
+        println!("  swapping");
+        swapping(&mut report);
+    }
     if all || which == "sync" {
         println!("  sync");
         sync(&mut report);
@@ -484,6 +488,116 @@ fn pipes(report: &mut Report) {
         "wrote {refused} bytes into a pipe with no reader"
     );
     crate::pipe::close_writer(other);
+}
+
+/// A page written to disk, its frame taken away, and the same bytes back.
+///
+/// The whole claim of swapping in one check: the contents survive somewhere
+/// that is not memory, and the address keeps working.
+fn swapping(report: &mut Report) {
+    if !crate::ata::present() {
+        println!("    skip  no disk attached");
+        return;
+    }
+
+    let (free_before, _) = memory::allocator().stats();
+    let Some(space) = memory::AddressSpace::new() else {
+        check!(report, "create a space", false, "out of memory");
+        return;
+    };
+
+    const BASE: u64 = 0x0000_0060_0000;
+    const PAGES: u64 = 4;
+    let flags = memory::FLAG_USER | memory::FLAG_WRITABLE;
+    for index in 0..PAGES {
+        let Some(frame) = memory::allocator().allocate() else {
+            return;
+        };
+        if unsafe { space.map(BASE + index * 4096, frame, flags) }.is_err() {
+            return;
+        }
+    }
+
+    // Fill each page with a pattern that says which page it is, so a mix-up
+    // between slots shows up as wrong data rather than as nothing at all.
+    let kernel_root = memory::active_root();
+    unsafe { space.activate() };
+    for index in 0..PAGES {
+        let address = BASE + index * 4096;
+        for offset in (0..4096u64).step_by(512) {
+            unsafe { core::ptr::write_volatile((address + offset) as *mut u64, 0xA000 + index) };
+        }
+    }
+
+    let evicted = unsafe { memory::evict_one(space.root()) };
+    check!(
+        report,
+        "evicting returns a frame",
+        evicted.is_some(),
+        "{evicted:?}"
+    );
+    if let Some(frame) = evicted {
+        unsafe { memory::allocator().deallocate(frame) };
+    }
+
+    // Exactly one of the four should now be out on disk.
+    let mut swapped = 0;
+    let mut swapped_address = 0;
+    for index in 0..PAGES {
+        let address = BASE + index * 4096;
+        if let Some(entry) = memory::leaf_entry(space.root(), address) {
+            if memory::is_swapped_entry(entry) {
+                swapped += 1;
+                swapped_address = address;
+            }
+        }
+    }
+    check!(
+        report,
+        "one page is out on disk",
+        swapped == 1,
+        "{swapped} of {PAGES} swapped"
+    );
+
+    let (slots, evictions, _) = crate::swap::stats();
+    check!(
+        report,
+        "a slot is in use",
+        slots >= 1 && evictions >= 1,
+        "{slots} slots, {evictions} evictions"
+    );
+
+    // Touching it faults, and the fault handler brings it back. If the bytes
+    // are right, they went to a disk and came back.
+    let expected = 0xA000 + (swapped_address - BASE) / 4096;
+    let read_back = unsafe { core::ptr::read_volatile(swapped_address as *const u64) };
+    let tail = unsafe { core::ptr::read_volatile((swapped_address + 3584) as *const u64) };
+    check!(
+        report,
+        "the same bytes come back",
+        read_back == expected && tail == expected,
+        "read {read_back:#x} and {tail:#x}, expected {expected:#x}"
+    );
+
+    check!(
+        report,
+        "and it is present again",
+        memory::translate(swapped_address).is_some(),
+        "mapped again at {:?}",
+        memory::translate(swapped_address).map(|(p, _)| p)
+    );
+
+    unsafe {
+        memory::activate_root(kernel_root);
+        space.destroy();
+    }
+    let (free_after, _) = memory::allocator().stats();
+    check!(
+        report,
+        "no frames lost",
+        free_after == free_before,
+        "{free_before} -> {free_after}"
+    );
 }
 
 fn sync(report: &mut Report) {

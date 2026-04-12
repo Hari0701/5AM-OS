@@ -300,6 +300,12 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error: u64) {
     // is the fault that is not an error, and the one this handler has been
     // describing since the first week without ever acting on it.
     if error & PRESENT == 0 {
+        // A page that is out on disk. Bringing it back is invisible to the
+        // program: the instruction that faulted simply runs again.
+        if unsafe { crate::memory::swap_in(address) } {
+            return;
+        }
+
         if let Some(page) = unsafe { crate::memory::demand_fault(address) } {
             let id = crate::task::current_id();
             let count = crate::task::note_stack_fault(id);
