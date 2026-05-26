@@ -103,6 +103,10 @@ ap_trampoline_start:
     mov es, ax
     mov ss, ax
 
+    // Stage 1: executing at all, in 16-bit real mode. Physical address, no
+    // paging -- if this byte never changes, the processor never woke.
+    mov byte ptr [0x9000], 1
+
     lgdt [AP_GDTP]
 
     // Protected mode: one bit in CR0, and a far jump to make it take effect.
@@ -124,26 +128,44 @@ ap_protected:
     mov es, ax
     mov ss, ax
 
-    // Physical address extension, without which there is no long mode.
+    // Stage 2: protected mode, still no paging.
+    mov byte ptr [0x9000], 2
+
+    // PAE, without which there is no long mode -- plus the two bits that make
+    // SSE usable. This kernel is compiled with SSE enabled, so the first
+    // floating point or vector instruction on a core without OSFXSR faults.
     mov eax, cr4
-    or eax, 1 << 5
+    or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
     // The page tables the first processor is already using.
     mov eax, [AP_CR3]
     mov cr3, eax
 
-    // EFER.LME: long mode enabled, not yet active.
+    // EFER: long mode enabled, and no-execute *understood*.
+    //
+    // NXE is the one that cost a debugging session. The first processor turned
+    // it on, so the kernel's page tables have bit 63 set on every page that is
+    // not executable. On a core where NXE is clear, bit 63 is a **reserved**
+    // bit -- so walking those same tables raises a page fault with the reserved
+    // bit set in the error code, at the fourth instruction, before anything can
+    // report it.
+    //
+    // Page tables are shared between processors. The flags that decide how to
+    // *read* them are not.
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 1 << 8
+    or eax, (1 << 8) | (1 << 11)
     wrmsr
 
     // Paging on. Long mode activates at this instruction, which is exactly why
     // the trampoline must be identity mapped: the *next* instruction is fetched
     // through the page tables, from the same address it was already at.
+    // Paging on, and the FPU made usable in the same write: clear EM so SSE
+    // instructions are not treated as emulated, set MP alongside it.
     mov eax, cr0
-    or eax, 1 << 31
+    and eax, 0xFFFFFFFB
+    or eax, (1 << 1) | (1 << 31)
     mov cr0, eax
 
     // Same instruction, now in 32-bit mode, so no size prefix is needed.
@@ -153,6 +175,10 @@ ap_protected:
 
 .code64
 ap_long:
+    // Stage 3: long mode, paging on, and this instruction was fetched through
+    // the page tables -- which proves the identity mapping survived.
+    mov byte ptr [0x9000], 3
+
     mov rsp, [AP_STACK]
     mov rax, [AP_ENTRY]
     jmp rax
@@ -203,8 +229,32 @@ fn parameter_offsets() -> (usize, usize, usize) {
 /// one core. Allocating, scheduling or touching the task table would not be
 /// safe, so this does none of it.
 extern "C" fn ap_main() -> ! {
+    // Stage 4: Rust, on its own stack.
+    unsafe { core::ptr::write_volatile(crate::memory::physical_to_virtual(0x9000) as *mut u8, 4) };
+
+    // Descriptor tables first, before anything that could possibly fault.
+    //
+    // `lgdt` and `lidt` load *per-processor* registers. This core has never
+    // executed either, so it is running on the trampoline's temporary GDT with
+    // a null IDT -- and a core with a null IDT cannot dispatch its first
+    // exception, so it double faults, cannot dispatch that either, and triple
+    // faults. That is precisely what happened here, and the QEMU dump said so
+    // in one line: `IDT= 0000000000000000`.
+    unsafe {
+        crate::gdt::load_on_this_processor();
+        crate::interrupts::load_idt_on_this_processor();
+        core::ptr::write_volatile(crate::memory::physical_to_virtual(0x9000) as *mut u8, 5);
+    }
     let id = cpu_id();
     STARTED.fetch_add(1, Ordering::AcqRel);
+    unsafe {
+        core::ptr::write_volatile(crate::memory::physical_to_virtual(0x9000) as *mut u8, 6)
+    };
+
+    // Printing from here is the first genuinely shared thing this core touches,
+    // and it is safe for one reason: the console lock is a real atomic
+    // compare-exchange, not merely interrupts-off. That distinction looked like
+    // ceremony when there was one processor.
     crate::println!("[smp ] processor {id} is awake and running kernel code");
 
     // Park. Joining the scheduler needs a kernel that is safe for more than one
@@ -219,6 +269,77 @@ extern "C" fn ap_main() -> ! {
 ///
 /// # Safety
 /// Runs once, from the first core, after paging and the heap are up.
+/// How far the woken processor got: 0 never ran, 1 real mode, 2 protected,
+/// 3 long mode, 4 Rust.
+pub fn progress() -> u8 {
+    unsafe { core::ptr::read_volatile(crate::memory::physical_to_virtual(0x9000) as *const u8) }
+}
+
+pub fn clear_progress() {
+    unsafe { core::ptr::write_volatile(crate::memory::physical_to_virtual(0x9000) as *mut u8, 0) };
+}
+
+/// Is the APIC reachable at all? Reading its ID register is the cheapest
+/// possible test, and the first thing that can fault.
+pub fn probe_apic() -> Result<u32, &'static str> {
+    let virt = crate::memory::physical_to_virtual(APIC_BASE);
+    if crate::memory::translate(virt).is_none() {
+        return Err("the APIC's physical address is not mapped");
+    }
+    Ok(unsafe { apic_read(APIC_ID) >> 24 })
+}
+
+/// Put the trampoline in place without waking anything.
+pub unsafe fn install_trampoline() -> Result<usize, &'static str> {
+    if crate::memory::translate(TRAMPOLINE).is_none() {
+        let flags = crate::memory::FLAG_WRITABLE;
+        unsafe { crate::memory::map_page(TRAMPOLINE, TRAMPOLINE, flags) }?;
+    }
+    if crate::memory::translate(0x9000).is_none() {
+        let flags = crate::memory::FLAG_WRITABLE;
+        unsafe { crate::memory::map_page(0x9000, 0x9000, flags) }?;
+    }
+
+    let start = core::ptr::addr_of!(ap_trampoline_start) as *const u8;
+    let length = unsafe {
+        core::ptr::addr_of!(ap_trampoline_end) as usize
+            - core::ptr::addr_of!(ap_trampoline_start) as usize
+    };
+    unsafe { core::ptr::copy_nonoverlapping(start, TRAMPOLINE as *mut u8, length) };
+
+    let (cr3_offset, stack_offset, entry_offset) = parameter_offsets();
+    let cr3 = crate::memory::active_root();
+    let stack = alloc::vec![0u8; 16 * 1024].into_boxed_slice();
+    let top = (stack.as_ptr() as u64 + 16 * 1024) & !0xF;
+    core::mem::forget(stack);
+    unsafe {
+        *((TRAMPOLINE + cr3_offset as u64) as *mut u64) = cr3;
+        *((TRAMPOLINE + stack_offset as u64) as *mut u64) = top;
+        *((TRAMPOLINE + entry_offset as u64) as *mut u64) = ap_main as usize as u64;
+    }
+    clear_progress();
+    Ok(length)
+}
+
+/// Wake exactly one processor, so a failure names one thing.
+///
+/// # Safety
+/// The trampoline must already be installed.
+pub unsafe fn wake_one(target: u32) {
+    unsafe {
+        let spurious = apic_read(APIC_SPURIOUS);
+        apic_write(APIC_SPURIOUS, spurious | 0x100 | 0xFF);
+
+        apic_write(APIC_ICR_HIGH, target << 24);
+        apic_write(APIC_ICR_LOW, 0x0000_4500); // INIT, assert
+        delay(200_000);
+        apic_write(APIC_ICR_HIGH, target << 24);
+        apic_write(APIC_ICR_LOW, 0x0000_4600 | (TRAMPOLINE >> 12) as u32); // STARTUP
+        delay(400_000);
+    }
+}
+
+#[allow(dead_code)]
 pub unsafe fn start_others() {
     // The trampoline must be readable at the physical address the other cores
     // will jump to, *and* at the same virtual address once they turn paging on.

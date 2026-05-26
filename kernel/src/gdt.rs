@@ -188,6 +188,49 @@ pub unsafe fn init() {
     }
 }
 
+/// Load the already-built GDT into *this* processor.
+///
+/// `lgdt` is a per-processor instruction. The table is one shared structure in
+/// memory, but every core has its own register pointing at it, and a core that
+/// has never executed `lgdt` is using whatever it was left with -- for a core
+/// woken by a startup message, that is a temporary table in a trampoline.
+///
+/// No `ltr` here. The task register names a TSS, and a TSS holds the stack the
+/// processor switches to on a privilege change: sharing one between two cores
+/// would mean two trap frames landing on the same stack. A core that never
+/// enters ring 3 does not need one, and a core that does needs its own.
+///
+/// # Safety
+/// The GDT must already have been built by `init`.
+pub unsafe fn load_on_this_processor() {
+    unsafe {
+        let pointer = DescriptorTablePointer {
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
+            base: core::ptr::addr_of!(GDT) as u64,
+        };
+        asm!("lgdt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
+
+        asm!(
+            "push {sel}",
+            "lea {tmp}, [2f + rip]",
+            "push {tmp}",
+            "retfq",
+            "2:",
+            sel = in(reg) KERNEL_CODE as u64,
+            tmp = lateout(reg) _,
+            options(preserves_flags),
+        );
+
+        asm!(
+            "mov ss, {0:x}",
+            "mov ds, {0:x}",
+            "mov es, {0:x}",
+            in(reg) KERNEL_DATA,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Point the CPU at a different kernel stack for the next entry from ring 3.
 ///
 /// Every task that can run in ring 3 needs its own, and the scheduler sets this

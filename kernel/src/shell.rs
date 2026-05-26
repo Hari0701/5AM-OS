@@ -114,6 +114,7 @@ fn execute(command: &str) {
         "exec" => exec(rest),
         "translate" => translate(rest),
         "pagemap" => pagemap(),
+        "smp" => smp_step(rest.trim()),
         "llm" => llm(rest),
         "model" => crate::llm::describe(),
         "fault" => fault(rest),
@@ -172,6 +173,8 @@ fn help() {
     println!("  exec <file>       load an ELF off the disk and run it in ring 3");
     println!("  translate <addr>  walk the page tables for an address");
     println!("  pagemap           which 512 GiB slots of the address space exist");
+    println!("  smp <step>        bring up a second processor, one step at a time");
+    println!("                    steps: apic | install | wake");
     println!("  model             what neural network is loaded, if any");
     println!("  llm <prompt>      run that network. It writes stories; it does");
     println!("                    NOT know anything about this kernel.");
@@ -542,6 +545,61 @@ fn user_mode() {
 /// Every virtual address on this machine falls into one of 512 top-level slots.
 /// Almost all of them are empty -- an address space is mostly a hole, and the
 /// holes are what make a 64-bit address space affordable.
+/// Start a second processor one step at a time, so a failure names one thing.
+///
+/// Doing this from the shell rather than at boot is the whole point: a fault
+/// here prints, and a fault during boot resets the machine and tells you
+/// nothing. The first attempt at this produced nine boot banners and no
+/// information at all.
+fn smp_step(step: &str) {
+    println!();
+    match step {
+        "apic" => match crate::smp::probe_apic() {
+            Ok(id) => {
+                println!("  the local APIC answers. This processor is number {id}.");
+                println!("  Every core reads a different value from the same address,");
+                println!("  which is what makes it a *local* APIC.");
+            }
+            Err(error) => {
+                println!("  {error}");
+                println!();
+                println!("  The bootloader maps physical *memory*. The APIC is");
+                println!("  memory-mapped I/O above RAM, so it may simply not be in");
+                println!("  that mapping -- which would fault on the first read.");
+            }
+        },
+        "install" => match unsafe { crate::smp::install_trampoline() } {
+            Ok(length) => {
+                println!("  trampoline installed at 0x8000, {length} bytes.");
+                println!("  identity mapped, so it survives paging being switched on");
+                println!("  halfway through it.");
+                println!("  progress byte is now {}", crate::smp::progress());
+            }
+            Err(error) => println!("  could not install it: {error}"),
+        },
+        "wake" => {
+            println!("  sending INIT then STARTUP to processor 1 ...");
+            unsafe { crate::smp::wake_one(1) };
+            let progress = crate::smp::progress();
+            println!();
+            println!("  it got to stage {progress}:");
+            println!("    0  never executed a single instruction");
+            println!("    1  running, 16-bit real mode");
+            println!("    2  protected mode");
+            println!("    3  long mode, paging on, identity map survived");
+            println!("    4  running Rust on its own stack");
+            println!("    5  loaded its own GDT and IDT");
+            println!("    6  past the point that used to triple fault");
+            if progress >= 4 {
+                println!();
+                println!("  {} processors awake.", crate::smp::started());
+            }
+        }
+        _ => println!("  usage: smp apic | smp install | smp wake"),
+    }
+    println!();
+}
+
 fn pagemap() {
     println!();
     println!("  The level-4 table: 512 slots, each covering 512 GiB.");

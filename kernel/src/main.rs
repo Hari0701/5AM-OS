@@ -33,6 +33,7 @@ mod pipe;
 mod selftest;
 mod serial;
 mod shell;
+mod smp;
 mod signal;
 mod sync;
 mod swap;

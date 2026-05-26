@@ -413,6 +413,26 @@ pub fn current() -> (u64, u16) {
     (pointer.base, pointer.limit)
 }
 
+/// Load the already-built IDT into *this* processor.
+///
+/// Same story as the GDT, and with a sharper edge: a core with a null IDT
+/// cannot dispatch its first exception, so it double faults, cannot dispatch
+/// that either, and triple faults. The machine resets with nothing printed --
+/// which is exactly what a freshly woken processor did here until it was given
+/// this. The QEMU dump said so in one line: `IDT= 0000000000000000`.
+///
+/// # Safety
+/// The IDT must already have been built by `init`.
+pub unsafe fn load_idt_on_this_processor() {
+    unsafe {
+        let pointer = DescriptorTablePointer {
+            limit: (size_of::<[Entry; 256]>() - 1) as u16,
+            base: core::ptr::addr_of!(IDT) as u64,
+        };
+        asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
+    }
+}
+
 /// Is a given vector wired up? Used by the shell to show the live table.
 pub fn is_present(vector: usize) -> bool {
     unsafe {
