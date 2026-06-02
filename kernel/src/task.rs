@@ -90,15 +90,11 @@ pub struct Task {
     _stack: Option<Box<[u8]>>,
     pub switches: u64,
     /// Lower runs first. 0 is the shell; background work sits well below it.
-    pub priority: u8,
-    /// Scheduling rounds this task has been passed over.
     ///
-    /// Subtracted from `priority`, and that subtraction is the entire
-    /// anti-starvation argument. Priorities are bounded (0..=MAX_PRIORITY) and
-    /// this is not, so a task skipped MAX_PRIORITY+1 times outranks anything
-    /// on the machine. Starvation is therefore not merely unlikely, it is
-    /// impossible, with a stated bound.
-    pub waited: u16,
+    /// An *input* to scheduling, not a decision made by it. What a policy does
+    /// with this number -- weight it, ignore it, age it -- lives in `sched.rs`,
+    /// which is why the counter that used to sit beside it does too.
+    pub priority: u8,
     /// What the task returned, once it has finished.
     pub exit_code: u64,
     /// The level-4 table this task runs on, for tasks that have one of their
@@ -181,7 +177,6 @@ impl Task {
             _stack: None,
             switches: 0,
             priority: DEFAULT_PRIORITY,
-            waited: 0,
             exit_code: 0,
             address_space: None,
             parent: None,
@@ -208,6 +203,16 @@ static mut ENABLED: bool = false;
 
 fn tasks() -> &'static mut [Task; MAX_TASKS] {
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
+}
+
+/// A read-only view of the task table, for code that must look but not touch.
+///
+/// This is what a scheduling policy is handed. Giving it the mutable table
+/// instead would make the contract as wide as the kernel: a brick could mark a
+/// task Ready, rewrite a stack pointer, or free a slot, and none of those
+/// failures would be attributable to the policy that caused them.
+pub fn snapshot() -> &'static [Task; MAX_TASKS] {
+    unsafe { &*core::ptr::addr_of!(TASKS) }
 }
 
 pub fn current_id() -> usize {
@@ -271,6 +276,10 @@ pub fn spawn_with_priority(
         let len = bytes.len().min(task.name.len());
         task.name[..len].copy_from_slice(&bytes[..len]);
         task.name_len = len;
+
+        // Slot 3 today is not slot 3 from ten seconds ago. Whatever the policy
+        // remembered about the last occupant is now wrong.
+        crate::sched::task_created(id);
 
         Ok(id)
     })
@@ -381,56 +390,37 @@ extern "C" fn schedule(stack_pointer: u64) -> u64 {
         return stack_pointer;
     }
 
-    let tasks = tasks();
     let current = current_id();
-    tasks[current].stack_pointer = stack_pointer;
-
-    // Anything sleeping until a deadline that has now passed becomes runnable
-    // again. Doing this here, in the timer, is the entire implementation of
-    // "sleep": there is no separate timer subsystem, only a scheduler that
-    // checks the clock before it chooses.
     let now = crate::interrupts::ticks();
-    for task in tasks.iter_mut() {
-        if let State::Blocked(Reason::Until(deadline)) = task.state {
-            if now >= deadline {
-                task.state = State::Ready;
+
+    // Save where we were, and wake anything whose deadline has passed. Doing
+    // the second here, in the timer, is the entire implementation of "sleep":
+    // there is no separate timer subsystem, only a scheduler that checks the
+    // clock before it chooses.
+    //
+    // Scoped so the mutable borrow is finished before the policy is asked --
+    // it gets a read-only view, and nothing it can do reaches the task table.
+    {
+        let tasks = tasks();
+        tasks[current].stack_pointer = stack_pointer;
+        for task in tasks.iter_mut() {
+            if let State::Blocked(Reason::Until(deadline)) = task.state {
+                if now >= deadline {
+                    task.state = State::Ready;
+                }
             }
         }
     }
 
-    // Choose by effective priority, which is the stated priority minus how
-    // long the task has been passed over.
+    // Ask the installed policy who runs next.
     //
-    // A plain priority scheduler starves its lowest priority task forever, and
-    // the version of this that was here before did exactly that. What was
-    // actually wrong then was `wait_for` polling -- the waiter came back Ready
-    // on every tick, outranked everything, and prevented the very task it was
-    // waiting for. Priorities took the blame. Now that waiting genuinely
-    // blocks, this can be reinstated with a bound rather than a hope.
-    let mut next = current;
-    let mut best = i32::MAX;
-    for offset in 1..=MAX_TASKS {
-        let candidate = (current + offset) % MAX_TASKS;
-        if tasks[candidate].state != State::Ready {
-            continue;
-        }
-        let effective = tasks[candidate].priority as i32 - tasks[candidate].waited as i32;
-        // Strictly less, and the scan starts just after the current task, so
-        // equal-priority tasks rotate rather than the lowest id always winning.
-        if effective < best {
-            best = effective;
-            next = candidate;
-        }
-    }
+    // This is the only line in the timer path that is a *decision* rather than
+    // a consequence. Everything above it and everything below it happens the
+    // same way whoever the answer is -- which is precisely why the answer can
+    // now come from somewhere replaceable. See `sched.rs`.
+    let next = crate::sched::choose(snapshot(), current, now);
 
-    // Age everyone who was runnable and did not get it. Unbounded growth here
-    // is deliberate: see `waited`.
-    for (id, task) in tasks.iter_mut().enumerate() {
-        if task.state == State::Ready && id != next {
-            task.waited = task.waited.saturating_add(1);
-        }
-    }
-    tasks[next].waited = 0;
+    let tasks = tasks();
 
     if next != current {
         unsafe { CURRENT = next };
@@ -579,9 +569,10 @@ pub fn busy() -> bool {
 
 pub fn reap_finished() {
     without_interrupts(|| {
-        for task in tasks().iter_mut().skip(1) {
+        for (id, task) in tasks().iter_mut().enumerate().skip(1) {
             if task.state == State::Finished {
                 *task = Task::empty();
+                crate::sched::task_exited(id);
             }
         }
     })
@@ -858,7 +849,6 @@ pub fn spawn_user(
         task.parent = parent;
         task.switches = 0;
         task.priority = DEFAULT_PRIORITY;
-        task.waited = 0;
         task.exit_code = 0;
         task.work = None;
         // Hold the allocation. Dropping it here frees the very stack the task
@@ -877,6 +867,8 @@ pub fn spawn_user(
         let len = bytes.len().min(task.name.len());
         task.name[..len].copy_from_slice(&bytes[..len]);
         task.name_len = len;
+
+        crate::sched::task_created(id);
 
         Ok(id)
     })
@@ -918,7 +910,6 @@ pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &
         task.parent = Some(parent);
         task.switches = 0;
         task.priority = tasks_priority(parent);
-        task.waited = 0;
         task.exit_code = 0;
         task.work = None;
         // Descriptors are inherited, and every pipe end gains an owner. That
@@ -945,6 +936,8 @@ pub fn fork_from(parent: usize, root: u64, frame: *const u64) -> Result<usize, &
         let name = b"child";
         task.name[..name.len()].copy_from_slice(name);
         task.name_len = name.len();
+
+        crate::sched::task_created(id);
 
         Ok(id)
     })
@@ -1088,6 +1081,7 @@ pub fn wait_any_child(parent: usize) -> Option<u64> {
                     orphans().push(root);
                 }
                 tasks[id] = Task::empty();
+                crate::sched::task_exited(id);
                 return Some(code);
             }
             None

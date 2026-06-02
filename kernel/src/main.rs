@@ -30,6 +30,7 @@ mod keyboard;
 mod narrate;
 mod oracle;
 mod pipe;
+mod sched;
 mod selftest;
 mod serial;
 mod shell;
