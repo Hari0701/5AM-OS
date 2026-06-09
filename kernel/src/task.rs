@@ -532,6 +532,7 @@ pub fn report() {
     if crate::llm::busy() {
         println!("  the model is claimed by one task (only one may run it)");
     }
+    println!("  policy: {} -- `sched` to see the others", crate::sched::active_name());
     println!("  id  name      state     prio switches");
     for (id, task) in tasks.iter().enumerate() {
         let state = match task.state {

@@ -63,6 +63,13 @@ pub fn run() -> ! {
                 let command = core::str::from_utf8(&line[..len]).unwrap_or("");
                 crate::task::reap_finished();
                 execute(command.trim());
+                // If the scheduler watchdog took the wheel back, say so here
+                // rather than where it happened. It happened inside the timer
+                // interrupt, where printing means waiting on a spinlock the
+                // interrupted code may be holding -- which on one core is not a
+                // wait, it is the end. This line runs at all only because the
+                // watchdog acted.
+                crate::sched::report_starvation();
                 len = 0;
                 prompt();
             }
@@ -97,6 +104,7 @@ fn execute(command: &str) {
         "screen" => screen(),
         "heap" => heap_status(),
         "tasks" => crate::task::report(),
+        "sched" => sched_command(rest.trim()),
         "spawn" => spawn(rest),
         "workers" => workers(),
         "ticker" => ticker(),
@@ -157,6 +165,8 @@ fn help() {
     println!("  screen            the framebuffer this text is drawn on");
     println!("  heap              the allocator, proved with a live Vec");
     println!("  tasks             what is running, and how often it switched");
+    println!("  sched [policy]    show, or swap, how the machine decides what");
+    println!("                    runs next: rr | fifo | prio | aging | mlfq");
     println!("  spawn <prompt>    run the transformer in the background and");
     println!("                    keep using the shell while it thinks");
     println!("  user              drop to ring 3 and come back through a");
@@ -385,6 +395,58 @@ fn workers() {
     }
     crate::task::reap_finished();
     println!();
+}
+
+/// Show or change the scheduling policy.
+///
+/// The point of this command is not that the machine can be tuned. It is that
+/// "which scheduler is better" stops being something you are told and becomes
+/// something you can do to the machine you are sitting in front of, in one
+/// word, and then watch.
+fn sched_command(argument: &str) {
+    if argument.is_empty() {
+        println!("  scheduling policies -- `*` is installed:");
+        println!();
+        let active = crate::sched::active_name();
+        for index in 0..crate::sched::COUNT {
+            let name = crate::sched::name_at(index);
+            let mark = if name == active { '*' } else { ' ' };
+            println!("   {mark} {name:<6}  {}", crate::sched::describe_at(index));
+        }
+        let (task, waited) = crate::sched::worst_wait();
+        println!();
+        println!("  the mechanism, not the policy, keeps this count:");
+        if waited == 0 {
+            println!("    no runnable task is currently being passed over.");
+        } else {
+            println!("    task {task} has been runnable and unpicked for {waited} ticks.");
+        }
+        println!("  `sched <name>` swaps the policy under the running machine.");
+        return;
+    }
+
+    if argument == crate::sched::active_name() {
+        println!("  `{argument}` is already installed.");
+        return;
+    }
+
+    // Everything the new policy needs to be told about the world it is
+    // inheriting. A fresh brick knows nothing, so installing one is a handover
+    // rather than an assignment -- see `sched::install`.
+    let installed = crate::sched::install_by_name(
+        argument,
+        crate::task::snapshot(),
+        crate::task::current_id(),
+        interrupts::ticks(),
+    );
+
+    if !installed {
+        println!("  no policy called `{argument}`. Try `sched` for the list.");
+        return;
+    }
+
+    println!("  installed `{argument}`: {}", crate::sched::active_description());
+    println!("  the runnable set was replayed into it; the next tick is its decision.");
 }
 
 fn sleep_command(argument: &str) {

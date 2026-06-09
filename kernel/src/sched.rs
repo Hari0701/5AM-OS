@@ -154,6 +154,183 @@ pub trait Policy {
     fn reset(&mut self) {}
 }
 
+// --- round robin ---------------------------------------------------------
+
+/// The simplest thing that is not obviously wrong: everybody in turn.
+///
+/// No state, no priorities, no bookkeeping — the scan starts just after the
+/// current task and takes the first runnable one it finds, so the current task
+/// is considered last and therefore goes to the back of the queue.
+///
+/// It is perfectly fair and that is precisely its problem. A task that blocks
+/// for a keystroke after two microseconds is treated identically to one that
+/// has been burning the CPU for a minute, so interactive work waits behind
+/// batch work for no reason anybody chose. Every policy below is an argument
+/// about how to tell those two apart.
+pub struct Rr;
+
+impl Rr {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for Rr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Policy for Rr {
+    fn name(&self) -> &'static str {
+        "rr"
+    }
+
+    fn describe(&self) -> &'static str {
+        "everybody in turn, one tick each. fair, and blind"
+    }
+
+    fn pick(&mut self, queue: &RunQueue) -> Option<usize> {
+        let current = queue.current();
+        for offset in 1..=MAX_TASKS {
+            let candidate = (current + offset) % MAX_TASKS;
+            if queue.is_ready(candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+// --- first come, first served --------------------------------------------
+
+/// Run whoever arrived first, until they stop wanting the CPU.
+///
+/// The oldest scheduling policy there is, and the one every batch system used
+/// before interactive computing existed. It is **non-preemptive**: the running
+/// task keeps the processor until it blocks or exits, and only then does the
+/// longest-waiting task get a turn.
+///
+/// On this machine that is a live demonstration rather than a description. A
+/// task that never blocks — `Work::Hog`, or a ring 3 program in a loop — holds
+/// the CPU against a shell that is merely more important, and the machine stops
+/// answering. That is not a bug in this brick; it is what the policy *is*, and
+/// it is why the watchdog below exists.
+pub struct Fifo {
+    /// When each task arrived, as a monotonically increasing stamp. This is the
+    /// state `on_ready` exists for: arrival order cannot be recovered from a
+    /// snapshot of who is runnable, because the snapshot has no history in it.
+    arrived: [u64; MAX_TASKS],
+    stamp: u64,
+}
+
+impl Fifo {
+    pub const fn new() -> Self {
+        Self {
+            arrived: [0; MAX_TASKS],
+            stamp: 0,
+        }
+    }
+}
+
+impl Default for Fifo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Policy for Fifo {
+    fn name(&self) -> &'static str {
+        "fifo"
+    }
+
+    fn describe(&self) -> &'static str {
+        "first come, first served, non-preemptive. WILL hang the shell"
+    }
+
+    fn pick(&mut self, queue: &RunQueue) -> Option<usize> {
+        // Non-preemptive: if whoever is running still wants the CPU, they keep
+        // it. This single line is the whole difference from round robin, and
+        // the whole reason the machine can stop responding.
+        let current = queue.current();
+        if queue.is_ready(current) {
+            return Some(current);
+        }
+        queue.ready().min_by_key(|&id| self.arrived[id])
+    }
+
+    fn on_ready(&mut self, id: usize) {
+        if id < MAX_TASKS {
+            self.stamp += 1;
+            self.arrived[id] = self.stamp;
+        }
+    }
+
+    fn on_exit(&mut self, id: usize) {
+        if id < MAX_TASKS {
+            self.arrived[id] = 0;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.arrived = [0; MAX_TASKS];
+        self.stamp = 0;
+    }
+}
+
+// --- strict priority ------------------------------------------------------
+
+/// Always the most important runnable task, and never anybody else.
+///
+/// This exists to be compared with [`Aging`], which is the same algorithm plus
+/// one subtraction. Run `selftest priority` under each and the difference is
+/// the entire argument for aging: here the lowest-priority task runs zero
+/// times while a priority 0 task spins, because "most important" is evaluated
+/// afresh every tick and the answer never changes.
+///
+/// Starvation is not a failure mode of this policy. It is the specification.
+pub struct Prio;
+
+impl Prio {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for Prio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Policy for Prio {
+    fn name(&self) -> &'static str {
+        "prio"
+    }
+
+    fn describe(&self) -> &'static str {
+        "strict priority, no aging. starves the bottom by design"
+    }
+
+    fn pick(&mut self, queue: &RunQueue) -> Option<usize> {
+        let current = queue.current();
+        let mut chosen = None;
+        let mut best = u16::MAX;
+        for offset in 1..=MAX_TASKS {
+            let candidate = (current + offset) % MAX_TASKS;
+            if !queue.is_ready(candidate) {
+                continue;
+            }
+            let priority = queue.priority(candidate) as u16;
+            if priority < best {
+                best = priority;
+                chosen = Some(candidate);
+            }
+        }
+        chosen
+    }
+}
+
 // --- priority with aging -------------------------------------------------
 
 /// The policy this kernel has always had, now as a brick.
@@ -244,15 +421,163 @@ impl Policy for Aging {
     }
 }
 
+// --- multi-level feedback queue ------------------------------------------
+
+/// Work out what a task *is* by watching what it does.
+///
+/// Every policy above is told how to rank tasks. `prio` and `aging` are told by
+/// a priority number somebody assigned; `rr` and `fifo` are told nothing and
+/// treat everything alike. This one is told nothing and **infers**, which is
+/// the idea that made interactive computing work and is still what Linux,
+/// Windows and macOS are all doing underneath.
+///
+/// The observation it rests on is small: a task that runs out its whole time
+/// slice is telling you it is CPU-bound, and a task that blocks before the
+/// slice ends is telling you it is waiting on something a person is probably
+/// attached to. Neither one had to declare anything. The scheduler simply
+/// watched.
+///
+/// ## The rules
+///
+/// 1. Higher queue wins. Round robin within a queue.
+/// 2. A new task starts at the top -- optimism, and it is cheap to be wrong.
+/// 3. Use your whole quantum and you drop one level.
+/// 4. Block before it expires and you stay where you are.
+/// 5. Every `BOOST` ticks, everybody goes back to the top.
+///
+/// ## Why rule 5 is not optional
+///
+/// Rules 1-4 alone starve long-running work exactly as `prio` does, and worse,
+/// they do it to tasks that did nothing wrong -- a compile that has been
+/// running for a minute is at the bottom forever. The periodic boost is the
+/// floor, and it is the same argument aging makes, made in one move instead of
+/// continuously. Take rule 5 out and `bench sched` will show you the hole.
+///
+/// ## Where the quanta come from
+///
+/// Doubling with depth: 2, 4, 8, 16 ticks. A task that has proved it is
+/// CPU-bound is cheaper to run for longer -- fewer switches for the same work,
+/// which is `fifo`'s one virtue, applied only where it does no harm.
+///
+/// The top quantum is 2 rather than 1 because the timer ticks at ~18.2 Hz and
+/// this kernel cannot see anything finer. With a 1-tick quantum, "blocked
+/// early" and "used it all" are the same measurement, and rule 3 would demote
+/// the very tasks rule 4 exists to protect.
+pub struct Mlfq {
+    level: [u8; MAX_TASKS],
+    /// When everybody goes back to the top.
+    boost_at: u64,
+}
+
+/// How many queues. Four is the usual number and there is nothing magic in it.
+const LEVELS: u8 = 4;
+/// Ticks between boosts.
+const BOOST: u64 = 25;
+
+impl Mlfq {
+    pub const fn new() -> Self {
+        Self {
+            level: [0; MAX_TASKS],
+            boost_at: 0,
+        }
+    }
+}
+
+impl Default for Mlfq {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Policy for Mlfq {
+    fn name(&self) -> &'static str {
+        "mlfq"
+    }
+
+    fn describe(&self) -> &'static str {
+        "infers interactivity from behaviour. nobody declares anything"
+    }
+
+    fn pick(&mut self, queue: &RunQueue) -> Option<usize> {
+        let now = queue.now();
+        if now >= self.boost_at {
+            // Rule 5. Everybody back to the top, including whoever has been at
+            // the bottom long enough to have been forgotten.
+            self.level = [0; MAX_TASKS];
+            self.boost_at = now + BOOST;
+        }
+
+        // Rule 1: best level wins; rule 2: rotate within it, which is what
+        // scanning from `current + 1` and taking strictly-better gives us.
+        let current = queue.current();
+        let mut chosen = None;
+        let mut best = u8::MAX;
+        for offset in 1..=MAX_TASKS {
+            let candidate = (current + offset) % MAX_TASKS;
+            if !queue.is_ready(candidate) {
+                continue;
+            }
+            if self.level[candidate] < best {
+                best = self.level[candidate];
+                chosen = Some(candidate);
+            }
+        }
+        chosen
+    }
+
+    fn quantum(&mut self, id: usize, _queue: &RunQueue) -> u32 {
+        2u32 << self.level[id.min(MAX_TASKS - 1)]
+    }
+
+    fn on_yield(&mut self, id: usize, used_full_quantum: bool) {
+        if id >= MAX_TASKS {
+            return;
+        }
+        // Rule 3 and rule 4, and this single branch is the entire policy. Note
+        // that nothing here asks what the task *is* -- only what it just did.
+        if used_full_quantum && self.level[id] + 1 < LEVELS {
+            self.level[id] += 1;
+        }
+    }
+
+    fn on_ready(&mut self, id: usize) {
+        // Rule 2. A task nobody has seen before is assumed to be interactive,
+        // because being wrong costs one quantum and being right saves a
+        // person's afternoon.
+        if id < MAX_TASKS {
+            self.level[id] = 0;
+        }
+    }
+
+    fn on_exit(&mut self, id: usize) {
+        if id < MAX_TASKS {
+            self.level[id] = 0;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.level = [0; MAX_TASKS];
+        self.boost_at = 0;
+    }
+}
+
 // --- the registry --------------------------------------------------------
 
+static mut RR: Rr = Rr::new();
+static mut FIFO: Fifo = Fifo::new();
+static mut PRIO: Prio = Prio::new();
 static mut AGING: Aging = Aging::new();
+static mut MLFQ: Mlfq = Mlfq::new();
 
 /// How many bricks are registered.
-pub const COUNT: usize = 1;
+pub const COUNT: usize = 5;
+
+/// The one policy that is guaranteed not to starve anybody, and therefore the
+/// only safe thing for the watchdog to fall back to.
+const SAFE: usize = 3;
 
 /// Which policy is installed, as an index into [`policy_at`].
-static mut ACTIVE: usize = 0;
+static mut ACTIVE: usize = SAFE;
 
 /// Ticks left in the current quantum. Zero forces a fresh decision.
 static mut REMAINING: u32 = 0;
@@ -266,6 +591,10 @@ static mut REMAINING: u32 = 0;
 fn policy_at(index: usize) -> &'static mut dyn Policy {
     unsafe {
         match index {
+            0 => &mut *core::ptr::addr_of_mut!(RR),
+            1 => &mut *core::ptr::addr_of_mut!(FIFO),
+            2 => &mut *core::ptr::addr_of_mut!(PRIO),
+            4 => &mut *core::ptr::addr_of_mut!(MLFQ),
             _ => &mut *core::ptr::addr_of_mut!(AGING),
         }
     }
@@ -321,10 +650,11 @@ pub fn choose(tasks: &[Task; MAX_TASKS], current: usize, now: u64) -> usize {
         return current;
     }
 
-    let policy = policy_at(active_index());
+    let active = active_index();
+    let policy = policy_at(active);
     policy.on_yield(current, remaining == 0);
 
-    match policy.pick(&queue) {
+    let next = match policy.pick(&queue) {
         Some(id) => {
             let quantum = policy.quantum(id, &queue).max(1);
             unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(REMAINING), quantum) };
@@ -335,9 +665,154 @@ pub fn choose(tasks: &[Task; MAX_TASKS], current: usize, now: u64) -> usize {
             unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(REMAINING), 0) };
             current
         }
+    };
+
+    watchdog(&queue, next, active, tasks, current, now);
+    next
+}
+
+// --- the starvation watchdog ---------------------------------------------
+//
+// A policy is allowed to be wrong. `fifo` will hold the CPU against a shell
+// that is merely more important, and `prio` will never run the bottom task at
+// all -- those are the lessons, not defects. But a machine you cannot type into
+// is a machine you cannot learn anything else from, so the mechanism keeps its
+// own count and takes the wheel back.
+//
+// It counts in the mechanism, not in the policy, for the same reason the
+// benchmark counters will: a policy that graded itself could report whatever it
+// liked, and the entire value of comparing bricks rests on the numbers being
+// collected by something with no stake in the answer.
+
+/// Ticks a Ready task may go unpicked before the watchdog intervenes. The timer
+/// runs at the PIT's default ~18.2 Hz, so this is about five and a half
+/// seconds -- long enough to be unmistakably a hang, short enough to wait out.
+const STARVATION_TICKS: u32 = 100;
+
+/// How long each Ready task has gone without being chosen.
+static mut UNPICKED: [u32; MAX_TASKS] = [0; MAX_TASKS];
+
+/// What the watchdog saw, kept until somebody in a safe context reads it.
+#[derive(Clone, Copy)]
+pub struct Starvation {
+    pub task: usize,
+    pub ticks: u32,
+    /// The policy that was installed when it happened.
+    pub policy: usize,
+    /// Whether the watchdog put `aging` back.
+    pub reverted: bool,
+}
+
+static mut REPORT: Option<Starvation> = None;
+
+fn watchdog(
+    queue: &RunQueue,
+    next: usize,
+    active: usize,
+    tasks: &[Task; MAX_TASKS],
+    current: usize,
+    now: u64,
+) {
+    let unpicked = unsafe { &mut *core::ptr::addr_of_mut!(UNPICKED) };
+
+    let mut worst = 0usize;
+    let mut longest = 0u32;
+    for id in 0..MAX_TASKS {
+        // Not runnable, or it just ran: nothing owed to it.
+        if id == next || !queue.is_ready(id) {
+            unpicked[id] = 0;
+            continue;
+        }
+        unpicked[id] = unpicked[id].saturating_add(1);
+        if unpicked[id] > longest {
+            longest = unpicked[id];
+            worst = id;
+        }
+    }
+
+    if longest < STARVATION_TICKS {
+        return;
+    }
+
+    // Only the first one. A starving machine would otherwise overwrite the
+    // report every tick with a slightly larger number and lose the policy that
+    // was actually responsible.
+    let already = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(REPORT)) };
+    if already.is_some() {
+        return;
+    }
+
+    // `aging` starving somebody would be a genuine bug rather than a policy
+    // choice, so it is recorded and not "fixed" by reinstalling itself.
+    let reverted = active != SAFE;
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(REPORT),
+            Some(Starvation {
+                task: worst,
+                ticks: longest,
+                policy: active,
+                reverted,
+            }),
+        );
+    }
+
+    if reverted {
+        // Silently. `println!` takes a spinlock, and this runs inside the timer
+        // interrupt -- if the code we preempted was itself printing, waiting for
+        // that lock is a deadlock with interrupts already off. So the watchdog
+        // acts here and explains itself later, from the shell, which can only
+        // run again *because* it acted. See `report_starvation`.
+        install(SAFE, tasks, current, now);
     }
 }
 
+/// Print what the watchdog saw, if anything. Clears the report.
+///
+/// Called from the shell -- an ordinary task, where taking the console lock is
+/// safe. The machine is only able to reach this line because the watchdog put a
+/// policy back that lets the shell run, which is the demonstration.
+pub fn report_starvation() {
+    let report = crate::interrupts::without_interrupts(|| unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(REPORT);
+        slot.take()
+    });
+    let Some(report) = report else { return };
+
+    crate::println!();
+    crate::println!(
+        "  [sched] task {} was runnable and unpicked for {} ticks under `{}`.",
+        report.task,
+        report.ticks,
+        name_at(report.policy)
+    );
+    crate::println!("          that is starvation, and it is what this policy does.");
+    if report.reverted {
+        crate::println!(
+            "          the watchdog put `{}` back so you could read this.",
+            name_at(SAFE)
+        );
+    } else {
+        crate::println!("          `aging` bounds the wait, so this one is a bug. Not a lesson.");
+    }
+    crate::println!();
+}
+
+/// The longest any runnable task has currently gone unpicked, and who.
+pub fn worst_wait() -> (usize, u32) {
+    let unpicked = unsafe { &*core::ptr::addr_of!(UNPICKED) };
+    let mut worst = 0;
+    let mut longest = 0;
+    for (id, &waited) in unpicked.iter().enumerate() {
+        if waited > longest {
+            longest = waited;
+            worst = id;
+        }
+    }
+    (worst, longest)
+}
+
+/// Tell the installed policy that a task slot has been filled.
 pub fn task_created(id: usize) {
     policy_at(active_index()).on_ready(id);
 }
@@ -371,7 +846,24 @@ pub fn install(index: usize, tasks: &[Task; MAX_TASKS], current: usize, now: u64
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!(ACTIVE), index);
             core::ptr::write_volatile(core::ptr::addr_of_mut!(REMAINING), 0);
+            // The debt was owed by the policy being replaced.
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(UNPICKED), [0; MAX_TASKS]);
         }
     });
     true
+}
+
+/// Install by name, for the shell.
+pub fn install_by_name(
+    name: &str,
+    tasks: &[Task; MAX_TASKS],
+    current: usize,
+    now: u64,
+) -> bool {
+    for index in 0..COUNT {
+        if name_at(index) == name {
+            return install(index, tasks, current, now);
+        }
+    }
+    false
 }
