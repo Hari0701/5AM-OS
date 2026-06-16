@@ -165,6 +165,23 @@ pub enum Work {
     Hog(u64),
     /// Count as fast as it is given the CPU, until told to stop.
     Spinner,
+    /// Spin until an *absolute* tick, never blocking. The benchmark workload's
+    /// CPU-bound half.
+    ///
+    /// Absolute, not a duration, and that distinction is the whole reason this
+    /// exists beside `Hog`. A duration is measured from when the task first
+    /// runs, so a starved task simply starts its clock later and the run never
+    /// ends. A deadline fixed at spawn expires whether the task was ever
+    /// scheduled or not -- which is what lets a policy be measured while it is
+    /// being as unfair as it likes.
+    Burn { until: u64 },
+    /// Sleep, wake, do a little work, repeat, until an absolute tick.
+    ///
+    /// The benchmark's interactive half, and the task every scheduling policy
+    /// is really arguing about. It wants the CPU rarely and briefly, and it
+    /// wants it *soon* -- so the number that matters for this one is not how
+    /// many slices it got but how long it waited for the first.
+    Interactive { until: u64, gap: u64 },
 }
 
 impl Task {
@@ -213,6 +230,18 @@ fn tasks() -> &'static mut [Task; MAX_TASKS] {
 /// failures would be attributable to the policy that caused them.
 pub fn snapshot() -> &'static [Task; MAX_TASKS] {
     unsafe { &*core::ptr::addr_of!(TASKS) }
+}
+
+/// This task's name, for anything that has only an id. Empty for a free slot.
+pub fn name_of(id: usize) -> &'static str {
+    if id >= MAX_TASKS {
+        return "?";
+    }
+    let task = &snapshot()[id];
+    if task.state == State::Free {
+        return "-";
+    }
+    task.name()
 }
 
 pub fn current_id() -> usize {
@@ -332,6 +361,11 @@ extern "C" fn task_entry() -> ! {
     let id = current_id();
     let work = without_interrupts(|| tasks()[id].work.take());
 
+    // A measurement task announcing its own exit is sixteen lines of noise in
+    // the middle of a table, and console I/O is a different workload from the
+    // one being measured. The benchmark's tasks finish silently.
+    let quiet = matches!(work, Some(Work::Burn { .. }) | Some(Work::Interactive { .. }));
+
     match work {
         Some(Work::Generate(prompt)) => crate::llm::generate(&prompt, 96),
         Some(Work::Worker(index)) => worker(index),
@@ -359,6 +393,25 @@ extern "C" fn task_entry() -> ! {
                 SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
+        Some(Work::Burn { until }) => {
+            while crate::interrupts::ticks() < until {
+                core::hint::spin_loop();
+            }
+        }
+        Some(Work::Interactive { until, gap }) => {
+            // Nothing is printed. A benchmark task that writes to the console
+            // takes a lock and does I/O, which is a different workload from the
+            // one being described.
+            while crate::interrupts::ticks() < until {
+                sleep(gap);
+                // A short burst, so the task is genuinely runnable for a moment
+                // rather than instantly blocking again.
+                let burst = crate::interrupts::ticks() + 1;
+                while crate::interrupts::ticks() < burst {
+                    core::hint::spin_loop();
+                }
+            }
+        }
         None => {}
     }
 
@@ -368,8 +421,10 @@ extern "C" fn task_entry() -> ! {
     });
     // Anyone blocked in wait_for() is waiting on this task's slot address.
     wake_all(id as u64);
-    println!();
-    println!("[task] {id} finished. Press enter for a prompt.");
+    if !quiet {
+        println!();
+        println!("[task] {id} finished. Press enter for a prompt.");
+    }
 
     // The scheduler will not pick a Finished task again, so this only spins
     // until the next tick.

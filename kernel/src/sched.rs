@@ -667,8 +667,193 @@ pub fn choose(tasks: &[Task; MAX_TASKS], current: usize, now: u64) -> usize {
         }
     };
 
-    watchdog(&queue, next, active, tasks, current, now);
+    account(&queue, next, current, now);
+    watchdog(next, active, tasks, current, now);
     next
+}
+
+// --- what the mechanism counts -------------------------------------------
+//
+// Every number here is *logical*: ticks received, times passed over, switches
+// taken. Not one of them is a wall-clock measurement, and that is deliberate.
+// This kernel is usually run under TCG emulating x86 on a machine that is not
+// x86, where a millisecond figure measures the emulator and nothing else. A
+// count of slices means exactly the same thing on that machine as it does on
+// real hardware, which is what makes comparing two policies honest.
+//
+// They are collected here rather than by the policies for the same reason a
+// candidate does not count their own votes.
+
+/// Ticks each task has been given since the last reset.
+static mut SLICES: [u64; MAX_TASKS] = [0; MAX_TASKS];
+/// Ticks after the reset at which each task first got the CPU. `u64::MAX` means
+/// it never did -- which is itself the most interesting result a policy can
+/// produce.
+static mut FIRST_RUN: [u64; MAX_TASKS] = [u64::MAX; MAX_TASKS];
+/// The longest any task has gone runnable-but-unpicked since the reset. This is
+/// latency, in the only unit that survives emulation.
+static mut WORST: [u32; MAX_TASKS] = [0; MAX_TASKS];
+static mut SWITCHES: u64 = 0;
+static mut START_TICK: u64 = 0;
+
+fn account(queue: &RunQueue, next: usize, current: usize, now: u64) {
+    unsafe {
+        let slices = &mut *core::ptr::addr_of_mut!(SLICES);
+        let first = &mut *core::ptr::addr_of_mut!(FIRST_RUN);
+        let worst = &mut *core::ptr::addr_of_mut!(WORST);
+        let unpicked = &mut *core::ptr::addr_of_mut!(UNPICKED);
+
+        // Nobody runnable. `choose` coasts on the current task so the timer has
+        // something to return to, but the CPU is about to `hlt` -- crediting a
+        // blocked task with the tick would show an idle machine as a busy one,
+        // and the trace would draw a solid bar for a task that was asleep.
+        let idle = !queue.is_ready(next);
+
+        if !idle {
+            slices[next] = slices[next].saturating_add(1);
+            if first[next] == u64::MAX {
+                let start = core::ptr::read_volatile(core::ptr::addr_of!(START_TICK));
+                first[next] = now.saturating_sub(start);
+            }
+        }
+        if !idle && next != current {
+            let switches = core::ptr::read_volatile(core::ptr::addr_of!(SWITCHES));
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(SWITCHES),
+                switches.saturating_add(1),
+            );
+        }
+
+        // How long everybody else has been waiting. Counted always, even when
+        // the watchdog's *intervention* is switched off -- the benchmark needs
+        // the number precisely in the runs where nothing is allowed to rescue
+        // the machine.
+        let mut ready_mask = 0u8;
+        for id in 0..MAX_TASKS {
+            if queue.is_ready(id) {
+                ready_mask |= 1 << id;
+            }
+            if id == next || !queue.is_ready(id) {
+                unpicked[id] = 0;
+                continue;
+            }
+            unpicked[id] = unpicked[id].saturating_add(1);
+            if unpicked[id] > worst[id] {
+                worst[id] = unpicked[id];
+            }
+        }
+
+        trace_push(now, if idle { usize::MAX } else { next }, ready_mask);
+    }
+}
+
+/// Start a fresh measurement window.
+pub fn reset_stats(now: u64) {
+    crate::interrupts::without_interrupts(|| unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SLICES), [0; MAX_TASKS]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(FIRST_RUN), [u64::MAX; MAX_TASKS]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(WORST), [0; MAX_TASKS]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(UNPICKED), [0; MAX_TASKS]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SWITCHES), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(START_TICK), now);
+    })
+}
+
+/// Ticks this task has been given since the reset.
+pub fn slices(id: usize) -> u64 {
+    if id >= MAX_TASKS {
+        return 0;
+    }
+    unsafe { (*core::ptr::addr_of!(SLICES))[id] }
+}
+
+/// When this task first got the CPU, in ticks after the reset. `None` if it
+/// never did.
+pub fn first_run(id: usize) -> Option<u64> {
+    if id >= MAX_TASKS {
+        return None;
+    }
+    match unsafe { (*core::ptr::addr_of!(FIRST_RUN))[id] } {
+        u64::MAX => None,
+        ticks => Some(ticks),
+    }
+}
+
+/// The longest this task went runnable and unpicked since the reset.
+pub fn worst_wait_of(id: usize) -> u32 {
+    if id >= MAX_TASKS {
+        return 0;
+    }
+    unsafe { (*core::ptr::addr_of!(WORST))[id] }
+}
+
+/// Context switches since the reset.
+pub fn switches() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SWITCHES)) }
+}
+
+// --- the trace ------------------------------------------------------------
+//
+// Two bytes per tick: who ran, and who *wanted* to.
+//
+// The second one is the whole reason this is worth 2 KiB. A record of which
+// task ran is a log; a record of who was runnable and passed over is a picture
+// of the decision, and starvation stops being a number in a table and becomes a
+// solid bar you can point at.
+
+const TRACE_LENGTH: usize = 1024;
+
+/// The task that got each tick.
+static mut TRACE_RAN: [u8; TRACE_LENGTH] = [0xFF; TRACE_LENGTH];
+/// A bit per task: who was Ready on that tick. `MAX_TASKS` is 8, so the whole
+/// runnable set of the machine fits in one byte.
+static mut TRACE_READY: [u8; TRACE_LENGTH] = [0; TRACE_LENGTH];
+/// The tick of the most recent entry, and how many entries are valid.
+static mut TRACE_LAST: u64 = 0;
+static mut TRACE_COUNT: usize = 0;
+
+/// `ran >= MAX_TASKS` means the machine was idle on this tick.
+fn trace_push(tick: u64, ran: usize, ready: u8) {
+    unsafe {
+        let count = core::ptr::read_volatile(core::ptr::addr_of!(TRACE_COUNT));
+        let index = (count) % TRACE_LENGTH;
+        (*core::ptr::addr_of_mut!(TRACE_RAN))[index] = if ran < MAX_TASKS { ran as u8 } else { 0xFF };
+        (*core::ptr::addr_of_mut!(TRACE_READY))[index] = ready;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TRACE_COUNT), count.wrapping_add(1));
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TRACE_LAST), tick);
+    }
+}
+
+/// What happened on one tick: the task that ran, and the runnable set.
+///
+/// `None` if that tick is outside the window the ring buffer still holds.
+pub fn trace_at(tick: u64) -> Option<(usize, u8)> {
+    unsafe {
+        let count = core::ptr::read_volatile(core::ptr::addr_of!(TRACE_COUNT));
+        let last = core::ptr::read_volatile(core::ptr::addr_of!(TRACE_LAST));
+        if count == 0 || tick > last {
+            return None;
+        }
+        let back = (last - tick) as usize;
+        // Older than the buffer holds, or older than we have ever recorded.
+        if back >= TRACE_LENGTH || back >= count {
+            return None;
+        }
+        let index = (count - 1 - back) % TRACE_LENGTH;
+        let ran = (*core::ptr::addr_of!(TRACE_RAN))[index];
+        let ready = (*core::ptr::addr_of!(TRACE_READY))[index];
+        Some((ran as usize, ready))
+    }
+}
+
+/// The most recent tick the trace holds, and how far back it reaches.
+pub fn trace_window() -> (u64, u64) {
+    unsafe {
+        let count = core::ptr::read_volatile(core::ptr::addr_of!(TRACE_COUNT));
+        let last = core::ptr::read_volatile(core::ptr::addr_of!(TRACE_LAST));
+        let depth = count.min(TRACE_LENGTH) as u64;
+        (last, depth)
+    }
 }
 
 // --- the starvation watchdog ---------------------------------------------
@@ -689,8 +874,24 @@ pub fn choose(tasks: &[Task; MAX_TASKS], current: usize, now: u64) -> usize {
 /// seconds -- long enough to be unmistakably a hang, short enough to wait out.
 const STARVATION_TICKS: u32 = 100;
 
-/// How long each Ready task has gone without being chosen.
+/// How long each Ready task has gone without being chosen. Maintained by
+/// `account`, which runs whether or not the watchdog is allowed to act.
 static mut UNPICKED: [u32; MAX_TASKS] = [0; MAX_TASKS];
+
+/// May the watchdog intervene?
+///
+/// Switched off for the duration of a benchmark. A run of `fifo` that gets
+/// rescued halfway through is not a measurement of `fifo`, and the whole
+/// purpose of the exercise is to let a policy be as bad as it really is for as
+/// long as the run lasts. Every benchmark task carries its own absolute
+/// deadline for exactly this reason -- the machine recovers because the
+/// workload ends, not because anything saved it.
+static mut WATCHDOG: bool = true;
+
+/// Allow or forbid the watchdog's intervention. Counting continues either way.
+pub fn set_watchdog(enabled: bool) {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(WATCHDOG), enabled) };
+}
 
 /// What the watchdog saw, kept until somebody in a safe context reads it.
 #[derive(Clone, Copy)]
@@ -706,30 +907,18 @@ pub struct Starvation {
 static mut REPORT: Option<Starvation> = None;
 
 fn watchdog(
-    queue: &RunQueue,
-    next: usize,
+    _next: usize,
     active: usize,
     tasks: &[Task; MAX_TASKS],
     current: usize,
     now: u64,
 ) {
-    let unpicked = unsafe { &mut *core::ptr::addr_of_mut!(UNPICKED) };
-
-    let mut worst = 0usize;
-    let mut longest = 0u32;
-    for id in 0..MAX_TASKS {
-        // Not runnable, or it just ran: nothing owed to it.
-        if id == next || !queue.is_ready(id) {
-            unpicked[id] = 0;
-            continue;
-        }
-        unpicked[id] = unpicked[id].saturating_add(1);
-        if unpicked[id] > longest {
-            longest = unpicked[id];
-            worst = id;
-        }
+    if !unsafe { core::ptr::read_volatile(core::ptr::addr_of!(WATCHDOG)) } {
+        return;
     }
 
+    // `account` has already done the counting; this only reads the verdict.
+    let (worst, longest) = worst_wait();
     if longest < STARVATION_TICKS {
         return;
     }

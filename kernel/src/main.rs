@@ -14,6 +14,7 @@
 
 mod ai;
 mod ata;
+mod bench;
 extern crate alloc;
 
 mod elf;

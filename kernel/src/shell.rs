@@ -105,6 +105,8 @@ fn execute(command: &str) {
         "heap" => heap_status(),
         "tasks" => crate::task::report(),
         "sched" => sched_command(rest.trim()),
+        "bench" => bench_command(rest.trim()),
+        "timeline" => timeline_command(rest.trim()),
         "spawn" => spawn(rest),
         "workers" => workers(),
         "ticker" => ticker(),
@@ -167,6 +169,10 @@ fn help() {
     println!("  tasks             what is running, and how often it switched");
     println!("  sched [policy]    show, or swap, how the machine decides what");
     println!("                    runs next: rr | fifo | prio | aging | mlfq");
+    println!("  bench sched [n]   run one workload under every policy and print");
+    println!("                    the comparison. this is the argument, settled.");
+    println!("  timeline [n]      draw the last n ticks: who ran, and who was");
+    println!("                    runnable and passed over");
     println!("  spawn <prompt>    run the transformer in the background and");
     println!("                    keep using the shell while it thinks");
     println!("  user              drop to ring 3 and come back through a");
@@ -395,6 +401,37 @@ fn workers() {
     }
     crate::task::reap_finished();
     println!();
+}
+
+/// Draw what the scheduler has been doing.
+fn timeline_command(argument: &str) {
+    let span: u64 = match argument {
+        "" => 60,
+        text => match text.parse() {
+            Ok(value) if (8..=1024).contains(&value) => value,
+            _ => {
+                println!("  usage: timeline [ticks]   (8..1024, default 60)");
+                return;
+            }
+        },
+    };
+    let now = interrupts::ticks();
+    println!();
+    crate::bench::timeline(now.saturating_sub(span), now);
+    println!();
+}
+
+/// Measure something, rather than assert it.
+fn bench_command(argument: &str) {
+    let (what, rest) = split(argument);
+    match what {
+        "sched" => crate::bench::sched(rest),
+        "" => {
+            println!("  bench sched [ticks]   every scheduling policy, one workload,");
+            println!("                        one table. takes about half a minute.");
+        }
+        other => println!("  nothing to benchmark called `{other}`. Try `bench`."),
+    }
 }
 
 /// Show or change the scheduling policy.
