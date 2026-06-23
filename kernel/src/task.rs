@@ -232,6 +232,29 @@ pub fn snapshot() -> &'static [Task; MAX_TASKS] {
     unsafe { &*core::ptr::addr_of!(TASKS) }
 }
 
+/// Build a task table that will never be scheduled, for testing a policy.
+///
+/// A scheduling policy is a pure function of the runnable set, which means it
+/// can be examined without running anything -- and it should be, because the
+/// states worth checking are the awkward ones. "Exactly one task is Ready and
+/// it is not the current one" takes a paragraph of setup on a live machine and
+/// one line here, and a broken policy is caught in microseconds instead of
+/// hanging the console.
+///
+/// `spec` is (state, priority) for slot 0 upwards. Anything past its end stays
+/// Free.
+pub fn test_table(spec: &[(State, u8)]) -> [Task; MAX_TASKS] {
+    let mut table = [const { Task::empty() }; MAX_TASKS];
+    for (id, &(state, priority)) in spec.iter().enumerate().take(MAX_TASKS) {
+        table[id].state = state;
+        table[id].priority = priority;
+        let name = b"test";
+        table[id].name[..name.len()].copy_from_slice(name);
+        table[id].name_len = name.len();
+    }
+    table
+}
+
 /// This task's name, for anything that has only an id. Empty for a free slot.
 pub fn name_of(id: usize) -> &'static str {
     if id >= MAX_TASKS {

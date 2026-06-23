@@ -100,6 +100,10 @@ pub fn run(which: &str) {
         println!("  sched");
         sched(&mut report);
     }
+    if all || which == "policy" {
+        println!("  scheduling policies");
+        sched_policy(&mut report);
+    }
     if all || which == "priority" {
         println!("  priority");
         priority(&mut report);
@@ -677,6 +681,125 @@ fn sched(report: &mut Report) {
         "counter = {total}"
     );
     crate::task::reap_finished();
+}
+
+/// Is every registered scheduling policy *correct*?
+///
+/// Note what this suite does not ask. It says nothing about whether a policy is
+/// fair, whether it starves anybody, or whether it is any good — `fifo` passes
+/// every check here and will still hang your machine, and it is supposed to.
+/// That is the split the whole slot rests on:
+///
+///   * **conformance** is safety. A policy that picks a task which is not
+///     runnable will resume a stack that belongs to nobody, and no amount of
+///     cleverness elsewhere survives that. There is exactly one right answer
+///     and it is checked here.
+///   * **quality** is `bench sched`. There is no right answer, only trade-offs
+///     you can measure and then argue about.
+///
+/// Every registered brick is examined, including one you have just written, and
+/// it is examined against a synthetic task table rather than the live machine —
+/// so a broken policy is a failed line rather than a console that stops
+/// answering.
+fn sched_policy(report: &mut Report) {
+    use crate::task::State;
+
+    for index in 0..crate::sched::COUNT {
+        let name = crate::sched::name_at(index);
+        // Start from nothing known, so one policy's history cannot make
+        // another's answer look right.
+        crate::sched::test_reset(index);
+
+        // 1. Nobody is runnable. There is no honest answer but `None`, and a
+        //    policy that invents one hands the scheduler a task to resume that
+        //    is blocked, finished, or has never existed.
+        let empty = crate::task::test_table(&[
+            (State::Blocked(crate::task::Reason::Channel(1)), 0),
+            (State::Finished, 8),
+        ]);
+        let picked = crate::sched::test_pick(index, &empty, 0, 100);
+        check!(
+            report,
+            "picks nobody when nobody can",
+            picked.is_none(),
+            "{name}: chose {picked:?} from a table with no runnable task"
+        );
+
+        // 2. Exactly one runnable task, and it is not the current one. Any
+        //    policy that has a rotation, a queue or a priority order must still
+        //    arrive at the only available answer.
+        let one = crate::task::test_table(&[
+            (State::Blocked(crate::task::Reason::Channel(1)), 0),
+            (State::Free, 0),
+            (State::Ready, 9),
+        ]);
+        crate::sched::test_ready(index, 2);
+        let picked = crate::sched::test_pick(index, &one, 0, 200);
+        check!(
+            report,
+            "finds the only candidate",
+            picked == Some(2),
+            "{name}: chose {picked:?}, and task 2 was the only Ready one"
+        );
+
+        // 3. A crowd, repeatedly. Every answer must be a runnable task, and
+        //    there must always be one -- checked over many rounds because a
+        //    policy carries state and can be right once and wrong afterwards.
+        let crowd = crate::task::test_table(&[
+            (State::Ready, 0),
+            (State::Ready, 8),
+            (State::Blocked(crate::task::Reason::Until(9999)), 8),
+            (State::Ready, crate::task::MAX_PRIORITY),
+            (State::Finished, 4),
+        ]);
+        crate::sched::test_reset(index);
+        for id in [0usize, 1, 3] {
+            crate::sched::test_ready(index, id);
+        }
+
+        const ROUNDS: u64 = 200;
+        let mut illegal = 0usize;
+        let mut gave_up = 0usize;
+        let mut current = 0usize;
+        for round in 0..ROUNDS {
+            match crate::sched::test_pick(index, &crowd, current, 300 + round) {
+                Some(id) if id < crate::task::MAX_TASKS && crowd[id].state == State::Ready => {
+                    current = id
+                }
+                Some(_) => illegal += 1,
+                None => gave_up += 1,
+            }
+        }
+        check!(
+            report,
+            "only ever picks runnable",
+            illegal == 0,
+            "{name}: {ROUNDS} picks, {illegal} of them not runnable"
+        );
+        check!(
+            report,
+            "always picks somebody",
+            gave_up == 0,
+            "{name}: {ROUNDS} picks, {gave_up} gave up with 3 tasks Ready"
+        );
+
+        // 4. A quantum of zero is a scheduler that only ever schedules. The
+        //    mechanism clamps this, but a policy that returns it is telling us
+        //    something is wrong with its arithmetic.
+        let quantum = crate::sched::test_quantum(index, current, &crowd, current, 500);
+        check!(
+            report,
+            "asks for at least one tick",
+            quantum >= 1,
+            "{name}: wanted a quantum of {quantum}"
+        );
+
+        crate::sched::test_reset(index);
+    }
+
+    // Probing reset the installed policy too. Hand it the real runnable set
+    // back before the machine takes another timer interrupt.
+    crate::sched::resync();
 }
 
 /// Can a task that never yields starve one below it?

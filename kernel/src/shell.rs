@@ -178,7 +178,7 @@ fn help() {
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
     println!("  selftest [suite]  run the kernel's tests against itself");
-    println!("                    suites: heap memory space cow swap pipe sync sched priority elf fat");
+    println!("                    suites: heap memory space cow swap pipe sync sched policy priority elf fat");
     println!("  workers           three tasks share one semaphore, visibly");
     println!("  ticker            a kernel task that prints while other things run");
     println!("  sleep <ticks>     block this shell on the clock, not a spin");

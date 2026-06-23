@@ -1042,6 +1042,66 @@ pub fn install(index: usize, tasks: &[Task; MAX_TASKS], current: usize, now: u64
     true
 }
 
+// --- the conformance surface ---------------------------------------------
+//
+// A policy can be asked a question without the machine having to be in the
+// state the question describes. These four functions are what `selftest
+// sched-policy` uses to interrogate every registered brick against a synthetic
+// task table -- including one a learner has just written.
+//
+// They exist because the alternative is testing a scheduler by running it, and
+// a broken scheduler's failure mode is a machine that stops answering. A bug
+// found in microseconds against a fake table is worth a great deal more than
+// the same bug found as a hang.
+
+/// Ask a policy to choose, against a table that is not the live one.
+pub fn test_pick(
+    index: usize,
+    tasks: &[Task; MAX_TASKS],
+    current: usize,
+    now: u64,
+) -> Option<usize> {
+    policy_at(index.min(COUNT - 1)).pick(&RunQueue::new(tasks, current, now))
+}
+
+/// Ask a policy how long its choice should stand.
+pub fn test_quantum(
+    index: usize,
+    id: usize,
+    tasks: &[Task; MAX_TASKS],
+    current: usize,
+    now: u64,
+) -> u32 {
+    policy_at(index.min(COUNT - 1)).quantum(id, &RunQueue::new(tasks, current, now))
+}
+
+/// Wipe a policy's memory. Used before and after probing, so a test cannot
+/// leave the installed policy believing something about a task that never
+/// existed.
+pub fn test_reset(index: usize) {
+    policy_at(index.min(COUNT - 1)).reset();
+}
+
+/// Tell a policy a slot was filled, outside the live machine.
+pub fn test_ready(index: usize, id: usize) {
+    policy_at(index.min(COUNT - 1)).on_ready(id);
+}
+
+/// Put the installed policy back in step with reality.
+///
+/// Probing resets policies, including whichever one is actually running the
+/// machine. This replays the real runnable set into it, which is exactly what
+/// `install` does -- the same handover, for the same reason.
+pub fn resync() {
+    let index = active_index();
+    install(
+        index,
+        crate::task::snapshot(),
+        crate::task::current_id(),
+        crate::interrupts::ticks(),
+    );
+}
+
 /// Install by name, for the shell.
 pub fn install_by_name(
     name: &str,

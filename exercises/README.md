@@ -60,6 +60,13 @@ They build on each other. 1 and 2 are the foundation everything else stands on.
 | 5 | [Semaphore](05-semaphore.md) | Waiting without spinning | `selftest sync`, `selftest sched` |
 | 6 | [ELF loader](06-elf-loader.md) | Running a program you did not compile | `selftest elf` |
 | 7 | [Filesystem](07-filesystem.md) | Reading a file off a real disk | `selftest fat` |
+| 8 | [Scheduler](08-scheduler.md) | Deciding what runs next | `selftest policy`, `bench sched` |
+
+Lab 8 is the odd one out, deliberately. Every lab above it has a right answer
+and the tests know what it is. That one has no right answer — only trade-offs
+you measure with `bench sched` and then have to defend. It is also the only lab
+where the thing you write is a *replaceable part*: five other implementations of
+the same contract are already in the tree, and yours runs beside them.
 
 ## One rule
 
