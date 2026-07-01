@@ -992,22 +992,98 @@ pub fn is_shared(frame: u64) -> bool {
 /// are being used -- every replacement policy ever written is a way of making
 /// that one bit enough.
 const ACCESSED: u64 = 1 << 5;
+/// Set by the CPU on a write. See `PageSet::dirty` for why it is inert here.
+const DIRTY: u64 = 1 << 6;
 /// Ours: this entry names a swap slot, not a frame. Bit 10 is one of the three
 /// the CPU leaves alone, and it is what distinguishes a page that is *out* from
 /// one that never existed.
 const SWAPPED: u64 = 1 << 10;
 
-/// Where the clock hand is. It sweeps the pages of one address space in a
-/// circle, and where it stopped last time is the only state the algorithm has.
-static mut CLOCK_HAND: usize = 0;
+/// The resident user pages of one address space, as a replacement policy sees
+/// them.
+///
+/// Read-only with one exception. A policy may clear the accessed bit, because
+/// clearing it is the only way to measure the passage of time with a bit the
+/// CPU sets and never resets — and because it is harmless: the hardware simply
+/// sets it again on the next touch. Everything else is a question, not a
+/// change.
+///
+/// The dangerous decisions are not on this side of the line. Whether a page is
+/// safe to take at all — not shared with another address space, not already out
+/// on disk — is answered by [`PageSet::eligible`] before a policy sees it, and
+/// the answer a policy gives is re-checked before anything is written.
+pub struct PageSet<'a> {
+    pages: &'a [(u64, u64, *mut u64)],
+}
+
+impl<'a> PageSet<'a> {
+    fn new(pages: &'a [(u64, u64, *mut u64)]) -> Self {
+        Self { pages }
+    }
+
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    pub fn address(&self, index: usize) -> u64 {
+        self.pages[index].0
+    }
+
+    /// Read the live entry, not the snapshot the walk produced.
+    ///
+    /// This is load-bearing. A sweep that clears accessed bits and then tests a
+    /// copy taken before it started sees every page as freshly used on the
+    /// second lap, and goes round forever taking nothing. The algorithm depends
+    /// on seeing the effect of its own previous pass.
+    fn entry(&self, index: usize) -> u64 {
+        unsafe { *self.pages[index].2 }
+    }
+
+    /// Has the CPU translated through this page since the bit was last cleared?
+    pub fn accessed(&self, index: usize) -> bool {
+        self.entry(index) & ACCESSED != 0
+    }
+
+    /// Has it been written to?
+    ///
+    /// Real hardware state, and deliberately not actionable here. Elsewhere a
+    /// clean page can be dropped instead of written out, because it can be
+    /// re-read from the file it came from. This kernel has no file-backed
+    /// pages, so every victim costs a disk write whatever this says. It is
+    /// exposed because it is true, not because it helps yet.
+    pub fn dirty(&self, index: usize) -> bool {
+        self.entry(index) & DIRTY != 0
+    }
+
+    /// May this page be taken at all?
+    ///
+    /// A shared frame belongs to another address space too, and that space's
+    /// entry still points at the frame and knows nothing about a swap slot.
+    /// A page already out on disk has no frame left to reclaim.
+    pub fn eligible(&self, index: usize) -> bool {
+        let entry = self.entry(index);
+        entry & PRESENT != 0 && entry & SWAPPED == 0 && !is_shared(entry & ADDRESS_MASK)
+    }
+
+    /// Forget that this page was used. The one mutation a policy is allowed.
+    pub fn clear_accessed(&self, index: usize) {
+        let (address, _, pointer) = self.pages[index];
+        unsafe {
+            *pointer &= !ACCESSED;
+            asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        }
+    }
+}
 
 /// Evict one page from `root` and return the frame it was using.
 ///
-/// The clock: look at a page. If the CPU has touched it since the last sweep,
-/// clear that record and move on -- one reprieve. If it has not, take it. A
-/// page survives exactly as long as it keeps being used between two passes of
-/// the hand, which is the cheapest usable approximation of "least recently
-/// used" and the reason it is in everything.
+/// Everything here except one line is mechanism: gather the candidates, ask,
+/// check the answer, write the page out, rewrite the entry. Which page goes is
+/// the only decision, and it lives in `replace.rs`.
 ///
 /// # Safety
 /// The page's contents are written to disk and its mapping replaced. Nothing
@@ -1017,60 +1093,38 @@ pub unsafe fn evict_one(root: u64) -> Option<u64> {
     if pages.is_empty() {
         return None;
     }
+    let set = PageSet::new(&pages);
 
-    let start = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CLOCK_HAND)) };
+    let index = crate::replace::choose(&set)?;
 
-    // Two laps at most. The first clears accessed bits; if everything was in
-    // use, the second finds them all cleared and takes the first one -- so the
-    // sweep always terminates, which a single lap does not guarantee.
-    for step in 0..pages.len() * 2 {
-        let index = (start + step) % pages.len();
-        let (address, _, pointer) = pages[index];
-
-        // Re-read the entry rather than trusting the snapshot the walk
-        // produced. The first lap *clears* accessed bits, so testing the copy
-        // taken before that means every page still looks freshly used on the
-        // second lap and the hand goes round forever taking nothing. The whole
-        // algorithm depends on seeing the effect of its own previous pass.
-        let entry = unsafe { *pointer };
-
-        // Never take a shared page: another address space's entry still points
-        // at the frame and knows nothing about the slot.
-        if entry & SWAPPED != 0 || is_shared(entry & ADDRESS_MASK) {
-            continue;
-        }
-
-        if entry & ACCESSED != 0 {
-            // Used since the last sweep. Clear the record and give it a lap.
-            unsafe {
-                *pointer = entry & !ACCESSED;
-                asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
-            }
-            continue;
-        }
-
-        let frame = entry & ADDRESS_MASK;
-        let slot = crate::swap::allocate_slot()?;
-        if unsafe { crate::swap::write_out(slot, frame) }.is_err() {
-            crate::swap::free_slot(slot);
-            return None;
-        }
-
-        // Keep every flag except present, and put the slot where the frame
-        // was. The entry still describes the page completely -- writable, user,
-        // no-execute -- so faulting it back in restores exactly what was there.
-        unsafe {
-            *pointer = ((slot as u64) << 12) | (entry & !ADDRESS_MASK & !PRESENT) | SWAPPED;
-            asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!(CLOCK_HAND),
-                (index + 1) % pages.len(),
-            );
-        }
-        return Some(frame);
+    // Do not trust the answer. A policy that names a shared page would cost
+    // another address space a frame it is still reading, and a policy that
+    // names a page already on disk would free a frame twice. Refusing here
+    // means a wrong brick reports being out of memory rather than corrupting
+    // somebody else's.
+    if index >= pages.len() || !set.eligible(index) {
+        return None;
     }
 
-    None
+    let (address, _, pointer) = pages[index];
+    let entry = unsafe { *pointer };
+    let frame = entry & ADDRESS_MASK;
+
+    let slot = crate::swap::allocate_slot()?;
+    if unsafe { crate::swap::write_out(slot, frame) }.is_err() {
+        crate::swap::free_slot(slot);
+        return None;
+    }
+
+    // Keep every flag except present, and put the slot where the frame was.
+    // The entry still describes the page completely -- writable, user,
+    // no-execute -- so faulting it back in restores exactly what was there.
+    unsafe {
+        *pointer = ((slot as u64) << 12) | (entry & !ADDRESS_MASK & !PRESENT) | SWAPPED;
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+    crate::replace::note_evicted(address);
+    Some(frame)
 }
 
 /// Allocate a frame, evicting something if there is nothing free.
