@@ -238,6 +238,13 @@ pub unsafe fn map_page_in(
         *entry_ptr = (frame & ADDRESS_MASK) | flags | PRESENT;
     }
 
+    // Tell the replacement policy a user page arrived. Arrival order cannot be
+    // recovered later -- the page tables record what is resident, never when it
+    // became so -- so it has to be noticed here or not at all.
+    if user != 0 && virtual_address < USER_SPACE_END {
+        crate::replace::note_resident(virtual_address & !(PAGE_SIZE as u64 - 1));
+    }
+
     // The CPU caches translations in the TLB and will happily keep using a
     // stale one. `invlpg` drops the entry for this page specifically.
     unsafe {
@@ -1176,6 +1183,9 @@ pub unsafe fn swap_in(address: u64) -> bool {
         *pointer = frame | (entry & !ADDRESS_MASK & !SWAPPED) | PRESENT;
         asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
     }
+    // Resident again, and as far as the policy is concerned newly arrived --
+    // it writes the entry itself rather than going through `map_page_in`.
+    crate::replace::note_resident(page);
     true
 }
 

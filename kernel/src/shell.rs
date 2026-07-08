@@ -105,6 +105,7 @@ fn execute(command: &str) {
         "heap" => heap_status(),
         "tasks" => crate::task::report(),
         "sched" => sched_command(rest.trim()),
+        "paging" => paging_command(rest.trim()),
         "bench" => bench_command(rest.trim()),
         "timeline" => timeline_command(rest.trim()),
         "spawn" => spawn(rest),
@@ -169,6 +170,8 @@ fn help() {
     println!("  tasks             what is running, and how often it switched");
     println!("  sched [policy]    show, or swap, how the machine decides what");
     println!("                    runs next: rr | fifo | prio | aging | mlfq");
+    println!("  paging [policy]   show, or swap, which page leaves memory when");
+    println!("                    one has to: clock | fifo | nru | random");
     println!("  bench sched [n]   run one workload under every policy and print");
     println!("                    the comparison. this is the argument, settled.");
     println!("  timeline [n]      draw the last n ticks: who ran, and who was");
@@ -432,6 +435,40 @@ fn bench_command(argument: &str) {
         }
         other => println!("  nothing to benchmark called `{other}`. Try `bench`."),
     }
+}
+
+/// Show or change the page replacement policy.
+///
+/// The second slot in this kernel, and it exists to show the first was not a
+/// one-off. Same shape: a narrow contract, several implementations, swappable
+/// under a running machine, measured rather than argued about.
+fn paging_command(argument: &str) {
+    if argument.is_empty() {
+        println!("  page replacement policies -- `*` is installed:");
+        println!();
+        let active = crate::replace::active_name();
+        for index in 0..crate::replace::COUNT {
+            let name = crate::replace::name_at(index);
+            let mark = if name == active { '*' } else { ' ' };
+            println!("   {mark} {name:<7} {}", crate::replace::describe_at(index));
+        }
+        let (slots, evictions, faults) = crate::swap::stats();
+        println!();
+        println!("  {slots} swap slots in use, {evictions} pages out, {faults} brought back.");
+        println!("  `paging <name>` swaps the policy. `bench paging` compares them.");
+        return;
+    }
+
+    if argument == crate::replace::active_name() {
+        println!("  `{argument}` is already installed.");
+        return;
+    }
+    if !crate::replace::install_by_name(argument) {
+        println!("  no policy called `{argument}`. Try `paging` for the list.");
+        return;
+    }
+    println!("  installed `{argument}`: {}", crate::replace::active_description());
+    println!("  it decides the next time a frame is wanted and none is free.");
 }
 
 /// Show or change the scheduling policy.

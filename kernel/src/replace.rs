@@ -135,18 +135,306 @@ impl Replacer for Clock {
     }
 }
 
+// --- first in, first out --------------------------------------------------
+
+/// Throw out whatever has been resident longest, and ask nothing else.
+///
+/// The obvious policy, and the one worth implementing because of how it fails.
+/// It ignores the accessed bit entirely, so a page being read a thousand times
+/// a second leaves anyway the moment it is the oldest — which is the wrong
+/// answer often enough to matter.
+///
+/// But that is not the interesting failure. **FIFO can serve more page faults
+/// when you give it more memory.** Bélády found it in 1969 and it is deeply
+/// counter-intuitive: every other resource in a computer gets better when you
+/// add more of it. `bench paging` reproduces it on this machine, on real page
+/// tables, in about four seconds.
+///
+/// The reason is that FIFO is not a *stack algorithm* — the set of pages it
+/// keeps with three frames is not guaranteed to be a subset of what it keeps
+/// with four, so adding a frame can rearrange the whole future. LRU and
+/// optimal are stack algorithms and cannot do this. Clock is not one either,
+/// strictly, but in practice does not.
+///
+/// ## Where the order comes from
+///
+/// Not from the page set — that arrives in address order and has no history in
+/// it. Arrival order is only knowable if somebody records it as it happens,
+/// which is what `on_resident` is for and the whole reason the trait has
+/// notifications rather than just `choose`.
+pub struct Fifo {
+    address: [u64; TRACKED],
+    stamp: [u64; TRACKED],
+    next: u64,
+}
+
+/// How many pages FIFO remembers the arrival of. A fixed table rather than a
+/// `Vec`: this runs inside the page fault path, where allocating to decide how
+/// to free memory is a poor sequence of events.
+const TRACKED: usize = 128;
+
+impl Fifo {
+    pub const fn new() -> Self {
+        Self {
+            address: [0; TRACKED],
+            stamp: [0; TRACKED],
+            next: 1,
+        }
+    }
+
+    fn slot_of(&self, address: u64) -> Option<usize> {
+        (0..TRACKED).find(|&i| self.stamp[i] != 0 && self.address[i] == address)
+    }
+}
+
+impl Default for Fifo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Replacer for Fifo {
+    fn name(&self) -> &'static str {
+        "fifo"
+    }
+
+    fn describe(&self) -> &'static str {
+        "oldest resident page goes. shows Belady's anomaly"
+    }
+
+    fn choose(&mut self, pages: &PageSet) -> Option<usize> {
+        let mut best = None;
+        let mut oldest = u64::MAX;
+        for index in 0..pages.len() {
+            if !pages.eligible(index) {
+                continue;
+            }
+            // A page we never saw arrive is treated as older than any we did.
+            // That is the safe default: it is either from before this policy
+            // was installed, or it overflowed the table.
+            let age = match self.slot_of(pages.address(index)) {
+                Some(slot) => self.stamp[slot],
+                None => 0,
+            };
+            if age < oldest {
+                oldest = age;
+                best = Some(index);
+            }
+        }
+        best
+    }
+
+    fn on_resident(&mut self, address: u64) {
+        // First arrival wins. Re-stamping on every touch would make this LRU,
+        // which is a different policy and a better one.
+        if self.slot_of(address).is_some() {
+            return;
+        }
+        let free = (0..TRACKED)
+            .find(|&i| self.stamp[i] == 0)
+            .or_else(|| {
+                // Table full: forget the oldest, which is the one most likely
+                // to be evicted next anyway.
+                (0..TRACKED).min_by_key(|&i| self.stamp[i])
+            })
+            .unwrap_or(0);
+        self.address[free] = address;
+        self.stamp[free] = self.next;
+        self.next += 1;
+    }
+
+    fn on_evicted(&mut self, address: u64) {
+        if let Some(slot) = self.slot_of(address) {
+            self.stamp[slot] = 0;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.address = [0; TRACKED];
+        self.stamp = [0; TRACKED];
+        self.next = 1;
+    }
+}
+
+// --- not recently used ----------------------------------------------------
+
+/// Sort every page into one of four classes and take from the emptiest-first.
+///
+/// The two bits the hardware gives you, used as a pair rather than one at a
+/// time:
+///
+/// ```text
+///   class 0   not accessed, not written   cheapest to lose
+///   class 1   not accessed, written
+///   class 2   accessed, not written
+///   class 3   accessed, written           most likely to be wanted again
+/// ```
+///
+/// Take anything from the lowest non-empty class. It is cruder than the clock —
+/// it will happily evict a page that was accessed slightly less recently than
+/// another in the same class — and it is one pass with no position to remember.
+///
+/// ## The part that is not textbook
+///
+/// Classic NRU depends on *something else* clearing the accessed bits
+/// periodically, usually a timer. Without that every page reaches class 2 or 3
+/// and stays there, and the policy degenerates into "take the first eligible
+/// page" — which is address order, which is nothing.
+///
+/// This kernel has no such timer, so the reset is folded into the eviction
+/// itself: having chosen, clear every accessed bit on the way out. That makes
+/// each eviction the start of a fresh observation window. It is a real design
+/// decision and it is visible in the numbers — NRU trades the clock's smooth
+/// gradient for a sawtooth.
+pub struct Nru;
+
+impl Nru {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for Nru {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Replacer for Nru {
+    fn name(&self) -> &'static str {
+        "nru"
+    }
+
+    fn describe(&self) -> &'static str {
+        "four classes from two bits, lowest non-empty wins"
+    }
+
+    fn choose(&mut self, pages: &PageSet) -> Option<usize> {
+        let mut best: Option<(u8, usize)> = None;
+        for index in 0..pages.len() {
+            if !pages.eligible(index) {
+                continue;
+            }
+            let class = (pages.accessed(index) as u8) * 2 + pages.dirty(index) as u8;
+            if best.is_none_or(|(c, _)| class < c) {
+                best = Some((class, index));
+            }
+            if class == 0 {
+                break; // nothing can beat it
+            }
+        }
+        let (_, chosen) = best?;
+
+        // Start a fresh observation window. Without this the classes fill up
+        // and never empty -- see the note above.
+        for index in 0..pages.len() {
+            if pages.accessed(index) {
+                pages.clear_accessed(index);
+            }
+        }
+        Some(chosen)
+    }
+}
+
+// --- random ---------------------------------------------------------------
+
+/// Pick one at random.
+///
+/// Here as a control, and it is not a joke. Random has no state, no scan, no
+/// bits to maintain, and it cannot be defeated by an access pattern designed to
+/// defeat it — which is more than the clock can say. It also cannot suffer
+/// Bélády's anomaly in any systematic way.
+///
+/// Run `bench paging` and see how far off it is. The gap between random and a
+/// carefully reasoned policy is usually much smaller than the effort spent on
+/// the policy would suggest, and knowing the size of that gap is what stops you
+/// spending a month on the fifth refinement of a replacement algorithm.
+///
+/// The generator is xorshift64 from a fixed seed, so a run is reproducible.
+/// That is what a benchmark wants and the opposite of what anything security
+/// shaped wants -- a real one would take entropy from somewhere the caller
+/// cannot predict, and this kernel has nowhere like that yet.
+pub struct Random {
+    state: u64,
+}
+
+/// Fixed on purpose: the same run twice gives the same table.
+const SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
+impl Random {
+    pub const fn new() -> Self {
+        Self { state: 0 }
+    }
+
+    fn next(&mut self) -> u64 {
+        if self.state == 0 {
+            self.state = SEED;
+        }
+        // xorshift64. Three shifts and three xors, and good enough for anything
+        // that is not trying to keep a secret.
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+}
+
+impl Default for Random {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Replacer for Random {
+    fn name(&self) -> &'static str {
+        "random"
+    }
+
+    fn describe(&self) -> &'static str {
+        "no state, no scan, no bits. the control you compare against"
+    }
+
+    fn choose(&mut self, pages: &PageSet) -> Option<usize> {
+        let count = (0..pages.len()).filter(|&i| pages.eligible(i)).count();
+        if count == 0 {
+            return None;
+        }
+        let mut wanted = (self.next() % count as u64) as usize;
+        for index in 0..pages.len() {
+            if !pages.eligible(index) {
+                continue;
+            }
+            if wanted == 0 {
+                return Some(index);
+            }
+            wanted -= 1;
+        }
+        None
+    }
+
+    fn reset(&mut self) {
+        self.state = 0;
+    }
+}
+
 // --- the registry ---------------------------------------------------------
 
 static mut CLOCK: Clock = Clock::new();
+static mut FIFO: Fifo = Fifo::new();
+static mut NRU: Nru = Nru::new();
+static mut RANDOM: Random = Random::new();
 
 /// How many bricks are registered.
-pub const COUNT: usize = 1;
+pub const COUNT: usize = 4;
 
 static mut ACTIVE: usize = 0;
 
 fn replacer_at(index: usize) -> &'static mut dyn Replacer {
     unsafe {
         match index {
+            1 => &mut *core::ptr::addr_of_mut!(FIFO),
+            2 => &mut *core::ptr::addr_of_mut!(NRU),
+            3 => &mut *core::ptr::addr_of_mut!(RANDOM),
             _ => &mut *core::ptr::addr_of_mut!(CLOCK),
         }
     }
