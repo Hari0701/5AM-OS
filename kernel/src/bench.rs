@@ -44,10 +44,207 @@
 //! duration, because a run that got rescued halfway through is not a
 //! measurement of anything.
 
+use crate::memory;
 use crate::sched;
 use crate::shell::FloatText;
 use crate::task::{self, Work};
 use crate::{interrupts, println};
+
+// --- page replacement ------------------------------------------------------
+
+/// Where the benchmark's pages live. Any unused user address will do; this one
+/// is far from the program at 0x400000 and the stack below 0x110000.
+const PAGE_BASE: u64 = 0x2000_0000;
+
+/// Bélády's string, from the 1969 paper. Twelve references over five pages, and
+/// the smallest known demonstration that FIFO gets *worse* with more memory.
+const BELADY: [u8; 12] = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5];
+
+/// Two hot pages and a parade of cold ones — the shape almost all real programs
+/// have. This is where a policy that reads the accessed bit should beat one
+/// that does not.
+const LOCALITY: [u8; 18] = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2, 5, 1, 2, 6, 1, 2, 7, 1];
+
+/// Run one reference string under one policy with a fixed number of frames,
+/// and count the faults.
+///
+/// This is the textbook simulation, except nothing about it is simulated. The
+/// pages are real pages in a real address space, the accessed bits are set by
+/// the CPU translating through them, the evictions really write 4 KiB to the
+/// IDE disk, and the policy under test is the same code that runs when the
+/// machine genuinely runs out of memory.
+///
+/// The frame limit is enforced by evicting on purpose rather than by exhausting
+/// the allocator — there are 125,000 free frames and running the machine out of
+/// them to test three-frame behaviour would be a long way round. That is also
+/// what a real kernel does: this is *local* replacement against a fixed
+/// per-process allocation, which is one of the two ways the choice is framed.
+fn run_string(policy: usize, string: &[u8], frames: usize) -> Option<u64> {
+    crate::replace::install(policy);
+
+    let space = memory::AddressSpace::new()?;
+    let root = space.root();
+    core::mem::forget(space);
+    let kernel = memory::active_root();
+
+    let mut faults = 0u64;
+    let mut resident = 0usize;
+
+    interrupts::without_interrupts(|| {
+        // The scheduler installs a task's address space on every switch, and
+        // the shell has none -- so a timer tick in the middle of this would put
+        // the kernel's root back and the next touch would fault on an address
+        // that is only mapped over here.
+        unsafe { memory::activate_root(root) };
+
+        for &reference in string {
+            let page = PAGE_BASE + reference as u64 * memory::PAGE_SIZE as u64;
+
+            if memory::translate(page).is_some() {
+                touch(page, reference);
+                continue;
+            }
+
+            faults += 1;
+
+            // At the limit: somebody has to go, and which one is the question
+            // this whole module exists to ask.
+            if resident >= frames {
+                if let Some(frame) = unsafe { memory::evict_one(root) } {
+                    unsafe { memory::allocator().deallocate(frame) };
+                    resident -= 1;
+                }
+            }
+
+            let out_on_disk = memory::leaf_entry(root, page).is_some_and(memory::is_swapped_entry);
+            let arrived = if out_on_disk {
+                unsafe { memory::swap_in(page) }
+            } else {
+                match memory::allocator().allocate() {
+                    Some(frame) => unsafe {
+                        memory::map_page(
+                            page,
+                            frame,
+                            memory::FLAG_USER | memory::FLAG_WRITABLE,
+                        )
+                        .is_ok()
+                    },
+                    None => false,
+                }
+            };
+
+            if arrived {
+                resident += 1;
+                touch(page, reference);
+            }
+        }
+
+        // Bring everything home before tearing the space down. `destroy` walks
+        // present entries; a page still out on disk is not one, so its frame is
+        // already gone but its swap slot would be leaked and its entry left
+        // pointing at a slot that gets reused.
+        for &reference in string {
+            let page = PAGE_BASE + reference as u64 * memory::PAGE_SIZE as u64;
+            if memory::leaf_entry(root, page).is_some_and(memory::is_swapped_entry) {
+                unsafe { memory::swap_in(page) };
+            }
+        }
+
+        unsafe { memory::activate_root(kernel) };
+    });
+
+    unsafe { memory::AddressSpace::adopt(root).destroy() };
+    Some(faults)
+}
+
+/// Reference a page so the CPU records it.
+///
+/// Reads set the accessed bit; only writes set the dirty bit. Odd-numbered
+/// pages are written so that `nru` has something to classify -- with every page
+/// clean its four classes collapse to two, and the policy is not being shown
+/// doing what it does.
+fn touch(page: u64, reference: u8) {
+    unsafe {
+        let byte = core::ptr::read_volatile(page as *const u8);
+        if reference % 2 == 1 {
+            core::ptr::write_volatile(page as *mut u8, byte.wrapping_add(1));
+        }
+    }
+}
+
+/// Compare every page replacement policy on the same reference strings.
+pub fn paging() {
+    if task::busy() {
+        println!("  something is still running. The measurement needs the");
+        println!("  machine to itself.");
+        return;
+    }
+
+    let restore = crate::replace::active_name();
+    let (free_before, _) = memory::allocator().stats();
+
+    println!();
+    println!("  Real pages, real accessed bits, real 4 KiB writes to the disk.");
+    println!("  The frame limit is enforced by evicting on purpose, which is");
+    println!("  what a fixed per-process allocation means.");
+    println!();
+    println!("  Belady's string:  1 2 3 4 1 2 5 1 2 3 4 5");
+    println!();
+    println!("    policy    3 frames  4 frames");
+    for index in 0..crate::replace::COUNT {
+        let three = run_string(index, &BELADY, 3);
+        let four = run_string(index, &BELADY, 4);
+        let (Some(three), Some(four)) = (three, four) else {
+            println!("    {:<9} out of memory", crate::replace::name_at(index));
+            continue;
+        };
+        let note = if four > three {
+            "  <- more memory, MORE faults"
+        } else {
+            ""
+        };
+        println!(
+            "    {:<9} {three:>8}  {four:>8}{note}",
+            crate::replace::name_at(index)
+        );
+    }
+
+    println!();
+    println!("  Locality:  1 2 1 2 3 1 2 4 1 2 5 1 2 6 1 2 7 1   (1 and 2 are hot)");
+    println!();
+    println!("    policy    3 frames  4 frames");
+    for index in 0..crate::replace::COUNT {
+        let three = run_string(index, &LOCALITY, 3);
+        let four = run_string(index, &LOCALITY, 4);
+        if let (Some(three), Some(four)) = (three, four) {
+            let note = if four > three {
+                "  <- more memory, MORE faults"
+            } else {
+                ""
+            };
+            println!(
+                "    {:<9} {three:>8}  {four:>8}{note}",
+                crate::replace::name_at(index)
+            );
+        }
+    }
+
+    crate::replace::install_by_name(restore);
+    let (free_after, _) = memory::allocator().stats();
+
+    println!();
+    println!("  Every number is a page fault: how many of the references above");
+    println!("  found their page gone. Lower is better, and the second column");
+    println!("  is supposed to be lower than the first.");
+    println!();
+    if free_after == free_before {
+        println!("  {free_before} frames before, {free_after} after. Nothing leaked.");
+    } else {
+        println!("  LEAK: {free_before} frames before, {free_after} after.");
+    }
+    println!("  `{restore}` is installed again.");
+    println!();
+}
 
 /// How wide a timeline is drawn. Plus the label, this fits an 80-column
 /// terminal, which is the console this kernel actually has.

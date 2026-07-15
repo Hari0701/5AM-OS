@@ -499,3 +499,22 @@ pub fn install_by_name(name: &str) -> bool {
     }
     false
 }
+
+// --- the conformance surface ---------------------------------------------
+//
+// A replacer is a pure function of the page set, so it can be interrogated
+// without a single page being evicted. `selftest replace` uses these to put
+// every registered brick -- including one somebody has just written -- through
+// states that would be tedious and slow to arrange on a live machine.
+
+/// Ask a policy to choose, against a page set that is not a real address space.
+pub fn test_choose(index: usize, pages: &PageSet) -> Option<usize> {
+    replacer_at(index.min(COUNT - 1)).choose(pages)
+}
+
+/// Wipe a policy's memory, so one probe cannot make the next one's answer look
+/// right -- and so the installed brick is not left believing something about a
+/// page that never existed.
+pub fn test_reset(index: usize) {
+    replacer_at(index.min(COUNT - 1)).reset();
+}

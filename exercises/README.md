@@ -61,12 +61,20 @@ They build on each other. 1 and 2 are the foundation everything else stands on.
 | 6 | [ELF loader](06-elf-loader.md) | Running a program you did not compile | `selftest elf` |
 | 7 | [Filesystem](07-filesystem.md) | Reading a file off a real disk | `selftest fat` |
 | 8 | [Scheduler](08-scheduler.md) | Deciding what runs next | `selftest policy`, `bench sched` |
+| 9 | [Page replacement](09-page-replacement.md) | Deciding what leaves memory | `selftest replace`, `bench paging` |
 
-Lab 8 is the odd one out, deliberately. Every lab above it has a right answer
-and the tests know what it is. That one has no right answer — only trade-offs
-you measure with `bench sched` and then have to defend. It is also the only lab
-where the thing you write is a *replaceable part*: five other implementations of
-the same contract are already in the tree, and yours runs beside them.
+Labs 8 and 9 are the odd ones out, deliberately. Every lab above them has a
+right answer and the tests know what it is. These two do not — only trade-offs
+you measure and then have to defend. They are also the only labs where the thing
+you write is a *replaceable part*: several other implementations of the same
+contract are already in the tree, and yours runs beside them, on the same
+workload, in the same table.
+
+They are the same shape on purpose. A scheduler answers "who runs next" and a
+replacer answers "what leaves memory", and both turn out to be a narrow
+read-only view, one question, and a few notifications about things a snapshot
+cannot tell you. Doing the second one after the first is how you find out the
+shape was not a coincidence.
 
 ## One rule
 

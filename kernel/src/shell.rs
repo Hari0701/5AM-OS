@@ -174,6 +174,8 @@ fn help() {
     println!("                    one has to: clock | fifo | nru | random");
     println!("  bench sched [n]   run one workload under every policy and print");
     println!("                    the comparison. this is the argument, settled.");
+    println!("  bench paging      every page replacement policy, and Belady's");
+    println!("                    anomaly reproduced on real page tables");
     println!("  timeline [n]      draw the last n ticks: who ran, and who was");
     println!("                    runnable and passed over");
     println!("  spawn <prompt>    run the transformer in the background and");
@@ -181,7 +183,7 @@ fn help() {
     println!("  user              drop to ring 3 and come back through a");
     println!("                    syscall -- the privilege boundary, live");
     println!("  selftest [suite]  run the kernel's tests against itself");
-    println!("                    suites: heap memory space cow swap pipe sync sched policy priority elf fat");
+    println!("                    suites: heap memory space cow swap pipe sync sched policy replace priority elf fat");
     println!("  workers           three tasks share one semaphore, visibly");
     println!("  ticker            a kernel task that prints while other things run");
     println!("  sleep <ticks>     block this shell on the clock, not a spin");
@@ -429,9 +431,12 @@ fn bench_command(argument: &str) {
     let (what, rest) = split(argument);
     match what {
         "sched" => crate::bench::sched(rest),
+        "paging" => crate::bench::paging(),
         "" => {
             println!("  bench sched [ticks]   every scheduling policy, one workload,");
             println!("                        one table. takes about half a minute.");
+            println!("  bench paging          every page replacement policy against");
+            println!("                        two reference strings, on real pages.");
         }
         other => println!("  nothing to benchmark called `{other}`. Try `bench`."),
     }

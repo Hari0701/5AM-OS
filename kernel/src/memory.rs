@@ -1086,6 +1086,35 @@ impl<'a> PageSet<'a> {
     }
 }
 
+/// Fabricate a page table entry that belongs to no page table.
+///
+/// For testing a replacement policy against states that are tedious to produce
+/// on a live machine -- a set where everything is already swapped, or where
+/// exactly one page of six may be taken. A policy is a pure function of the
+/// page set, so it can be interrogated without evicting anything.
+pub fn test_entry(present: bool, accessed: bool, dirty: bool, swapped: bool) -> u64 {
+    // A frame number nothing else uses, so `is_shared` says no.
+    let mut entry = 0x7F_F000u64 | USER | WRITABLE;
+    if present {
+        entry |= PRESENT;
+    }
+    if accessed {
+        entry |= ACCESSED;
+    }
+    if dirty {
+        entry |= DIRTY;
+    }
+    if swapped {
+        entry |= SWAPPED;
+    }
+    entry
+}
+
+/// Wrap fabricated entries as a [`PageSet`].
+pub fn test_page_set(pages: &[(u64, u64, *mut u64)]) -> PageSet<'_> {
+    PageSet::new(pages)
+}
+
 /// Evict one page from `root` and return the frame it was using.
 ///
 /// Everything here except one line is mechanism: gather the candidates, ask,

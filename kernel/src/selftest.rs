@@ -100,6 +100,10 @@ pub fn run(which: &str) {
         println!("  sched");
         sched(&mut report);
     }
+    if all || which == "replace" {
+        println!("  page replacement policies");
+        replacers(&mut report);
+    }
     if all || which == "policy" {
         println!("  scheduling policies");
         sched_policy(&mut report);
@@ -681,6 +685,120 @@ fn sched(report: &mut Report) {
         "counter = {total}"
     );
     crate::task::reap_finished();
+}
+
+/// Is every registered page replacement policy *correct*?
+///
+/// The same split as `sched_policy`, one slot over. Correctness here has one
+/// right answer and safety rests on it: name a page that is shared with another
+/// address space and the mechanism would write it to disk and hand its frame
+/// away while a second process is still reading through it. Whether a policy is
+/// any *good* is `bench paging`, and that has no right answer at all.
+///
+/// Interrogated against fabricated entries that belong to no page table, so the
+/// awkward cases are cheap: a set where everything is already swapped, or where
+/// exactly one page of six may be taken.
+fn replacers(report: &mut Report) {
+    for index in 0..crate::replace::COUNT {
+        let name = crate::replace::name_at(index);
+        crate::replace::test_reset(index);
+
+        // 1. Nothing at all. A policy that indexes into an empty set is a
+        //    panic in the page fault path, which is the worst place for one.
+        let empty: [(u64, u64, *mut u64); 0] = [];
+        let picked = crate::replace::test_choose(index, &memory::test_page_set(&empty));
+        check!(
+            report,
+            "survives an empty set",
+            picked.is_none(),
+            "{name}: chose {picked:?} from nothing"
+        );
+
+        // 2. Candidates exist, but every one of them is already out on disk.
+        //    There is no frame left to reclaim in any of them.
+        let mut gone = [memory::test_entry(false, false, false, true); 4];
+        let pages = fabricate(&mut gone);
+        let picked = crate::replace::test_choose(index, &memory::test_page_set(&pages));
+        check!(
+            report,
+            "refuses when none are eligible",
+            picked.is_none(),
+            "{name}: chose {picked:?} with every candidate swapped out"
+        );
+
+        // 3. One taker among five that cannot be taken. Every policy has an
+        //    order it prefers, and all of them must still arrive at the only
+        //    available answer.
+        let mut one = [
+            memory::test_entry(false, false, false, true),
+            memory::test_entry(false, false, false, true),
+            memory::test_entry(true, true, true, false),
+            memory::test_entry(false, false, false, true),
+            memory::test_entry(false, false, false, true),
+        ];
+        let pages = fabricate(&mut one);
+        let picked = crate::replace::test_choose(index, &memory::test_page_set(&pages));
+        check!(
+            report,
+            "finds the only candidate",
+            picked == Some(2),
+            "{name}: chose {picked:?}, and index 2 was the only one eligible"
+        );
+
+        // 4. A crowd, repeatedly. A policy carries state and can be right once
+        //    and wrong afterwards, so ask many times.
+        const ROUNDS: usize = 200;
+        let mut crowd = [
+            memory::test_entry(true, true, false, false),
+            memory::test_entry(true, false, false, false),
+            memory::test_entry(false, false, false, true),
+            memory::test_entry(true, true, true, false),
+            memory::test_entry(true, false, true, false),
+        ];
+        let pages = fabricate(&mut crowd);
+        let set = memory::test_page_set(&pages);
+        crate::replace::test_reset(index);
+
+        let mut illegal = 0usize;
+        let mut gave_up = 0usize;
+        for _ in 0..ROUNDS {
+            match crate::replace::test_choose(index, &set) {
+                Some(i) if i < set.len() && set.eligible(i) => {}
+                Some(_) => illegal += 1,
+                None => gave_up += 1,
+            }
+        }
+        check!(
+            report,
+            "only ever names a taker",
+            illegal == 0,
+            "{name}: {ROUNDS} choices, {illegal} of them ineligible"
+        );
+        check!(
+            report,
+            "always finds one",
+            gave_up == 0,
+            "{name}: {ROUNDS} choices, {gave_up} gave up with four eligible"
+        );
+
+        crate::replace::test_reset(index);
+    }
+    // Probing reset the installed policy along with the rest.
+    crate::replace::install_by_name(crate::replace::active_name());
+}
+
+/// Turn fabricated entries into the (address, entry, pointer) triples a
+/// `PageSet` is built over. The addresses name nothing; only `invlpg` ever
+/// touches them, and flushing a translation that does not exist is a no-op.
+fn fabricate(entries: &mut [u64]) -> Vec<(u64, u64, *mut u64)> {
+    entries
+        .iter_mut()
+        .enumerate()
+        .map(|(index, entry)| {
+            let address = 0x5000_0000 + index as u64 * memory::PAGE_SIZE as u64;
+            (address, *entry, entry as *mut u64)
+        })
+        .collect()
 }
 
 /// Is every registered scheduling policy *correct*?
