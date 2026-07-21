@@ -147,6 +147,38 @@ ARM Mac is emulating x86 instruction by instruction.
 | Demand paging | working | The fault that is not an error |
 | Swapping | working | One hardware bit, and the clock that makes it enough |
 | Semaphores | working | Mutual exclusion that sleeps instead of spinning |
+| SMP bring-up | partial | A second core is awake; the kernel is not yet worthy of it |
+| Swappable schedulers | working | "Which policy is better" is a measurement, not an opinion |
+| Swappable page replacement | working | Bélády's anomaly, on real page tables |
+
+### Policies you can swap while it runs
+
+Two subsystems in this kernel are **slots** rather than decisions. The
+scheduler and the page-replacement algorithm each sit behind a narrow contract,
+several implementations ship in the tree, and you can change which one the
+machine is using from the shell and then measure what that cost you.
+
+```
+5am> sched
+  scheduling policies -- `*` is installed:
+
+     rr      everybody in turn, one tick each. fair, and blind
+     fifo    first come, first served, non-preemptive. WILL hang the shell
+     prio    strict priority, no aging. starves the bottom by design
+   * aging   priority minus how long you have waited. starvation is impossible
+     mlfq    infers interactivity from behaviour. nobody declares anything
+```
+
+`bench sched` runs one workload under every one of them and prints the
+comparison; `bench paging` does the same for `clock`, `fifo`, `nru` and
+`random` against two reference strings. Every number is a count rather than a
+time, because this usually runs under emulation where a millisecond figure
+measures the emulator.
+
+The point is not configurability. It is that "round robin is fair but bad for
+interactive work" and "FIFO can fault more when you give it more memory" stop
+being claims you are asked to believe and become tables the machine in front of
+you produced. See [The two slots](#the-two-slots) below.
 
 ### Shell commands
 
@@ -165,6 +197,18 @@ ask <question>    ask the kernel about itself -- answered inside this
 bridge <question> send the question to a host process over COM2 instead
 tasks             every task slot, its state and how often it was switched to
 spawn <prompt>    run a generation on its own stack and keep your prompt
+sched [policy]    show, or swap, how the machine decides what runs next:
+                  rr | fifo | prio | aging | mlfq
+paging [policy]   show, or swap, which page leaves memory when one has to:
+                  clock | fifo | nru | random
+bench sched [n]   one workload under every scheduling policy, one table
+bench paging      every replacement policy against two reference strings
+timeline [n]      draw the last n ticks: who ran, and who was passed over
+selftest [suite]  run the kernel's tests against itself, inside itself
+ls / cat / write / rm / exec        the FAT16 disk
+translate <addr>  walk the page tables for an address
+pagemap           which 512 GiB slots of the address space exist
+smp <step>        bring up a second processor, one step at a time
 clear             clear the screen
 ```
 
@@ -713,14 +757,22 @@ replacement is right:
 | 5 | [Semaphore](exercises/05-semaphore.md) | Waiting without spinning |
 | 6 | [ELF loader](exercises/06-elf-loader.md) | Running a program you did not compile |
 | 7 | [Filesystem](exercises/07-filesystem.md) | Reading a file off a real disk |
+| 8 | [Scheduler](exercises/08-scheduler.md) | Deciding what runs next |
+| 9 | [Page replacement](exercises/09-page-replacement.md) | Deciding what leaves memory |
 
 The tests run **inside the machine**, because that is the only honest place to
 check whether a page really got mapped. `cargo test` on your laptop can verify
 that an ELF header parses; it cannot take a page fault, switch a stack, or
 notice that the timer never fires again.
 
-`selftest` on its own runs all six suites. It found two real leaks the first
-time it ran, in code that had been working for weeks.
+`selftest` on its own runs every suite — 98 checks. It found two real leaks the
+first time it ran, in code that had been working for weeks.
+
+The last two labs are a different shape from the first seven, and deliberately
+so. Those have a right answer and the tests know what it is. These do not: you
+implement a brick for one of [the two slots](#the-two-slots), the conformance
+suite tells you whether it is *safe*, and `bench` hands you a table you then
+have to defend. Being unable to tell a learner they are right is the point.
 
 ### One rule
 
@@ -1185,6 +1237,103 @@ that reads a `Vec`.
 
 ---
 
+## The two slots
+
+Every chapter above this one ends with a decision made correctly and explained
+in a comment — which is the problem the labs exist to solve. Some decisions do
+not have a right answer, though, and for those a comment is worse than useless:
+it presents a trade-off as a conclusion.
+
+There are two of them in this kernel. *Which task runs next* and *which page
+leaves memory* are both questions every operating system answers differently,
+and none of them is wrong. So neither one is written down as an answer. Each is
+a **slot**: a narrow contract, several implementations, swappable while the
+machine runs, and a way to measure the difference.
+
+### The seam
+
+A scheduler does eight things and only two of them are a decision. Saving a
+stack pointer, waking sleepers, switching CR3, moving `TSS.RSP0`, delivering a
+signal — none of that depends on *which* task you pick. Eviction is the same:
+allocating a swap slot, writing the frame out, rewriting the entry, flushing the
+TLB is identical work whichever page was chosen.
+
+So the choosing is a trait with somewhere to keep its state, and everything else
+is mechanism that never learns policies exist:
+
+```rust
+fn pick(&mut self, queue: &RunQueue) -> Option<usize>;      // sched.rs
+fn choose(&mut self, pages: &PageSet) -> Option<usize>;     // replace.rs
+```
+
+What a policy may see is deliberately narrow and read-only. Hand it the mutable
+task table and the contract becomes as wide as the kernel — a brick could mark
+something Ready or rewrite a stack pointer, and no failure after that is
+attributable to the thing that caused it. Page replacement gets exactly one
+mutation, clearing the accessed bit, because that bit is set by hardware and
+cleared by nobody, so a policy that could only read it would have no way to
+measure time passing at all.
+
+Both slots also carry notifications, and for the same reason: a snapshot has no
+history in it. Arrival order, whether a task blocked early or burned its whole
+slice — none of that is recoverable from "who is runnable right now".
+
+### The results worth the trouble
+
+```
+5am> bench sched
+
+  policy  switches  fairness  worst wait  inter wait  starved  bg slices
+  rr            66  0.9981           3           3        0         15
+  fifo           8  0.2754          65          63        3          1
+  prio          67  0.7596          66           2        1          1
+  aging         67  0.8858          10           4        0          7
+  mlfq          24  0.9796           5           2        0          6
+```
+
+`prio` has the **best** interactive latency in that table and starves a task
+anyway. That row is worth sitting with, because it refutes the intuition that
+starvation means a scheduler is bad at scheduling. Strict priority is excellent
+at serving what you declared important. It simply has no floor.
+
+```
+5am> bench paging
+
+  Belady's string:  1 2 3 4 1 2 5 1 2 3 4 5
+
+    policy    3 frames  4 frames
+    clock            9         9
+    fifo             9        10  <- more memory, MORE faults
+    nru              8         7
+    random          10         6
+```
+
+The machine was given more memory and did more work — nine faults with three
+frames, ten with four, on the same references in the same order. Bélády found
+that in 1969 and it is still the most surprising true thing in the subject. Not
+simulated: real pages in a real address space, accessed bits set by the CPU,
+evictions that really write 4 KiB to the disk.
+
+### Correctness and quality are different questions
+
+Each slot has both, and keeping them apart is most of what the slots teach.
+
+`selftest policy` and `selftest replace` are **conformance**: never pick a task
+that is not runnable, never name a page another address space is still reading.
+There is exactly one right answer and safety rests on it. They run against
+synthetic tables rather than the live machine, so a broken brick is a failed
+line in microseconds rather than a console that stops answering.
+
+`bench sched` and `bench paging` are **quality**, and have no right answer at
+all. `fifo` passes every conformance check and will still hang your machine, and
+it is supposed to.
+
+[Labs 8 and 9](exercises/) take a brick away and ask for it back. They are the
+only labs where the tests cannot tell you whether you were right — only whether
+you were safe, and then hand you a table to defend.
+
+---
+
 ## The neural network
 
 5AM-OS runs a **Llama-2 transformer in ring 0** — 15 million parameters, a full
@@ -1367,6 +1516,12 @@ kernel/          the OS. compiled for x86_64-unknown-none, #![no_std]
   memory.rs      physical frames and the page tables
   heap.rs        the allocator behind Vec, String and Box
   task.rs        one scheduler: kernel tasks and user processes alike
+  sched.rs       the slot: five scheduling policies behind one contract
+  replace.rs     the slot: four page replacement policies behind another
+  bench.rs       runs one workload under every policy and prints the table
+  swap.rs        pages written past the end of the filesystem
+  signal.rs      a handler frame written onto the program's own stack
+  smp.rs         the trampoline that wakes a second processor
   pipe.rs        a bounded buffer, and what happens at its edges
   syscall.rs     ring 3, int 0x80, fork, exec, wait
   elf.rs         reads program headers and loads what they describe
@@ -1396,13 +1551,9 @@ because reading it is the point.
 - **UEFI images are disabled.** The `bootloader` crate's UEFI stage pins a
   version of the `uefi` crate that does not link against current nightly. BIOS
   boot works, which is all QEMU needs. See the note in `boot/Cargo.toml`.
-- **Kernel tasks still share one address space.** Ring 3 programs each get their
-  own level-4 table; kernel tasks are threads in one space.
-- **Forked processes do not run concurrently.** The child is queued and runs
-  when the parent exits. They are genuinely two processes with two address
-  spaces — they just take turns, because ring 3 is still not preemptible.
-- **No signals, no shared memory.** Pipes are the only IPC.
-- **No argv or environment.** `exec` takes a filename and nothing else.
+- **Kernel tasks share one address space.** Ring 3 programs each get their own
+  level-4 table; kernel tasks are threads in the kernel's, which is what makes
+  scheduling one of them beside a user process free.
 - **Demand paging is stacks only.** Program text and data are still loaded
   eagerly. Swapping applies to any user page, but nothing evicts on a timer —
   only when a frame is wanted and none is free.
@@ -1415,8 +1566,6 @@ because reading it is the point.
   exits, you land in it. A real machine calls that a panic.
 - **No environment variables, and no `PATH`.** A command is a filename in the
   root directory.
-- **No argv, no environment, no file descriptors.** `exec` takes a filename and
-  nothing else, and a program's only output is the `write` syscall.
 - **`static mut` is still the idiom** for most kernel state, reached through
   `addr_of_mut!`. Sound today because one core, and protected where it is
   shared; the right long-term answer is `UnsafeCell` behind the locks that now
@@ -1428,18 +1577,19 @@ because reading it is the point.
 - **No relocation.** Only `ET_EXEC` at a fixed address. Position-independent
   executables are refused rather than half-supported, because running one means
   choosing a base and applying relocations.
-- **Userspace is not preemptible.** Ring 3 runs with interrupts disabled,
-  because the timer entry does not yet understand a privilege change. One
-  program at a time, and it must exit by syscall.
-- **One address space.** Ring 3 is fenced off by the user bit, not by a
-  separate page table. Every task still shares one CR3, so "process" does not
-  mean what it means elsewhere.
 - **The mode switch is borrowed.** Real mode → protected → long mode is done by
   the `bootloader` crate, not by us. That is the most interesting part of boot,
   and writing our own stage is on the list.
-- **Single core.** The scheduler is round-robin across one CPU. Bringing up
-  the other cores means the APIC and an SMP trampoline, which is its own
-  project.
+- **SMP is one step of four.** A second processor is woken, walks real mode →
+  protected → long, loads its own GDT and IDT and prints from kernel code — and
+  then parks. It is not in the scheduler, because `without_interrupts` is a
+  complete critical section on one core and worth nothing on two. Per-CPU
+  state, real locks on the allocator and the task table, and TLB shootdown are
+  where the kernel actually changes. See `docs/attempts/smp.md`.
+- **No shared memory.** Pipes and signals are the only IPC.
+- **Only two subsystems are slots.** The scheduler and page replacement are
+  swappable and measured; the frame allocator, the heap and the filesystem are
+  each still one implementation with the decision baked in.
 - **The AI bridge needs a host process.** The kernel cannot reach a network by
   itself yet, so `ask` talks to `bridge/bridge.py` over a serial port rather
   than to the API directly. Removing that dependency means writing a virtio-net
