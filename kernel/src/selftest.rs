@@ -100,6 +100,10 @@ pub fn run(which: &str) {
         println!("  sched");
         sched(&mut report);
     }
+    if all || which == "claims" {
+        println!("  claims this repository makes about itself");
+        claims(&mut report);
+    }
     if all || which == "replace" {
         println!("  page replacement policies");
         replacers(&mut report);
@@ -685,6 +689,188 @@ fn sched(report: &mut Report) {
         "counter = {total}"
     );
     crate::task::reap_finished();
+}
+
+/// Do the things this repository *says about itself* still hold?
+///
+/// Every other suite here tests the kernel. This one tests the prose, and it
+/// exists because the prose has been wrong three times.
+///
+/// The README's limitations list asserted for weeks that there were no signals,
+/// no argv, one address space and no preemptible userspace, long after all four
+/// had shipped. The bridge's system prompt — whose entire job is telling a model
+/// what machine it is attached to — said the kernel had no allocator, no paging
+/// code of its own and no filesystem. `ask memory` said "there is no allocator,
+/// none" while `heap.rs` sat in the same directory.
+///
+/// None of those were caught by a test, because none of them were testable.
+/// They were sentences, and sentences do not fail.
+///
+/// So each check below is a claim made somewhere in the documentation, restated
+/// as something the machine can be asked. If a feature is ever removed the check
+/// fails and the sentence gets revisited; if a sentence is ever written that
+/// contradicts one of these, the contradiction is one boot away from being
+/// obvious.
+///
+/// Note what this cannot do. It cannot catch a claim about something the kernel
+/// does *not* have — "no network stack" is unfalsifiable from in here — and it
+/// cannot catch prose that is merely misleading. It catches the specific class
+/// that actually bit: a capability that arrived and a sentence that never
+/// noticed.
+fn claims(report: &mut Report) {
+    // "The heap allocator: the line where Vec and String start existing."
+    // Said not to exist by `ask memory` and by the bridge prompt.
+    let mut grown: Vec<u64> = Vec::new();
+    for value in 0..500u64 {
+        grown.push(value * 3);
+    }
+    check!(
+        report,
+        "there is an allocator",
+        grown.len() == 500 && grown[499] == 1497,
+        "a Vec grew to {} and kept its values",
+        grown.len()
+    );
+    drop(grown);
+
+    // "Page tables: four table reads to resolve one address." Said by `ask
+    // paging` to be the bootloader's work that we merely inherited.
+    let (free_before, _) = memory::allocator().stats();
+    const CLAIM_PAGE: u64 = 0x0000_3100_0000;
+    let built = memory::allocator().allocate().is_some_and(|frame| {
+        let mapped = unsafe { memory::map_page(CLAIM_PAGE, frame, memory::FLAG_WRITABLE) };
+        let resolves = memory::translate(CLAIM_PAGE).map(|(physical, _)| physical) == Some(frame);
+        unsafe { memory::unmap_page(CLAIM_PAGE) };
+        unsafe { memory::allocator().deallocate(frame) };
+        mapped.is_ok() && resolves
+    });
+    let (free_after, _) = memory::allocator().stats();
+    check!(
+        report,
+        "the kernel maps its own pages",
+        built && free_after == free_before,
+        "mapped, walked and unmapped {CLAIM_PAGE:#x} with no frames lost"
+    );
+
+    // "A process is a task with its own level-4 table." The README claimed for
+    // weeks that every task shared one CR3.
+    let private = match memory::AddressSpace::new() {
+        Some(space) => {
+            let root = space.root();
+            let distinct = root != memory::kernel_root() && root != 0;
+            unsafe { space.destroy() };
+            distinct
+        }
+        None => false,
+    };
+    check!(
+        report,
+        "a process gets its own space",
+        private,
+        "a fresh level-4 table is not the kernel's {:#x}",
+        memory::kernel_root()
+    );
+
+    // "Preemptible ring 3" and "argv + init", both denied by the README long
+    // after they worked. The frame a user task is resumed through carries the
+    // proof of each: the interrupt flag, and the two argument registers.
+    let mut scratch = vec![0u64; 48];
+    let top = (scratch.as_mut_ptr() as u64 + 48 * 8) & !0xF;
+    let frame = unsafe { crate::task::build_user_frame(top, 0x40_0000, 0x11_0000, 3, 0xBEEF) };
+    let word = |index: usize| unsafe { *((frame as *const u64).add(index)) };
+    check!(
+        report,
+        "ring 3 runs interruptible",
+        word(17) & (1 << 9) != 0 && word(16) & 3 == 3,
+        "RFLAGS {:#x} has IF set, CS {:#x} is ring 3",
+        word(17),
+        word(16)
+    );
+    check!(
+        report,
+        "argv reaches the program",
+        word(8) == 3 && word(9) == 0xBEEF,
+        "argc in rdi = {}, argv in rsi = {:#x}",
+        word(8),
+        word(9)
+    );
+    drop(scratch);
+
+    // "Pipes + file descriptors: end-of-file is a reference count." The README
+    // claimed there were no file descriptors at all.
+    let descriptors = match crate::pipe::create() {
+        Some(pipe) => {
+            let read = crate::task::add_descriptor(0, crate::task::Descriptor::PipeRead(pipe));
+            let write = crate::task::add_descriptor(0, crate::task::Descriptor::PipeWrite(pipe));
+            let ok = match (read, write) {
+                (Some(r), Some(w)) => {
+                    r != w
+                        && crate::task::descriptor(0, r) == crate::task::Descriptor::PipeRead(pipe)
+                        && crate::task::descriptor(0, w)
+                            == crate::task::Descriptor::PipeWrite(pipe)
+                }
+                _ => false,
+            };
+            if let Some(r) = read {
+                crate::task::close_descriptor(0, r);
+            }
+            if let Some(w) = write {
+                crate::task::close_descriptor(0, w);
+            }
+            ok
+        }
+        None => false,
+    };
+    check!(
+        report,
+        "descriptors are per-task integers",
+        descriptors,
+        "two small numbers named the two ends of one pipe"
+    );
+
+    // "Signals: the kernel calling a function the program never called," and
+    // SIGKILL is the one that cannot be declined. The README said neither
+    // existed.
+    let caught = crate::task::set_signal_handler(0, crate::signal::SIGINT, 0x1000, 0x2000);
+    let refused = !crate::task::set_signal_handler(0, crate::signal::SIGKILL, 0x1000, 0x2000);
+    crate::task::clear_signal_handlers(0);
+    check!(
+        report,
+        "signals exist, SIGKILL excepted",
+        caught && refused,
+        "a SIGINT handler was accepted and a SIGKILL handler was not"
+    );
+
+    // "FAT16: a file is a linked list living in a table." The bridge prompt
+    // said there was no filesystem.
+    let files = crate::fat::mount()
+        .and_then(|volume| volume.find("hello.elf"))
+        .is_ok();
+    check!(
+        report,
+        "there is a filesystem",
+        files,
+        "hello.elf was found on a real disk"
+    );
+
+    // The newest claim, and the one the front page now leads with: two
+    // subsystems are slots rather than decisions.
+    check!(
+        report,
+        "the scheduler is a slot",
+        crate::sched::COUNT > 1,
+        "{} policies registered, `{}` installed",
+        crate::sched::COUNT,
+        crate::sched::active_name()
+    );
+    check!(
+        report,
+        "page replacement is a slot",
+        crate::replace::COUNT > 1,
+        "{} policies registered, `{}` installed",
+        crate::replace::COUNT,
+        crate::replace::active_name()
+    );
 }
 
 /// Is every registered page replacement policy *correct*?

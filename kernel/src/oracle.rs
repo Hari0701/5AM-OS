@@ -88,9 +88,9 @@ fn unknown() {
     println!("This is a hand-written answer engine, not a model -- it only");
     println!("knows the topics someone taught it. Those are:");
     println!();
-    println!("  paging   memory   stack    gdt      idt");
-    println!("  faults   timer    keyboard serial   rings");
-    println!("  boot     cpu      thinking");
+    println!("  paging   memory   process  schedule stack");
+    println!("  gdt      idt      faults   timer    keyboard");
+    println!("  serial   rings    boot     cpu      thinking");
     println!();
     println!("For open-ended questions, `llm <prompt>` runs the neural network");
     println!("instead -- it will always answer, and it is much easier to");
@@ -301,18 +301,36 @@ static TOPICS: &[Topic] = &[
             println!("  PAE (CR4 bit 5) = {}. 64-bit paging cannot work without it.",
                 (cr4 >> 5) & 1);
             println!();
-            println!("  5AM-OS does not build these tables -- the bootloader did, and");
-            println!("  we inherited them. Writing our own is the next real milestone.");
+            println!("  The bootloader built the FIRST of these tables and mapped all");
+            println!("  of physical memory at an offset, which is what makes the walk");
+            println!("  above reachable at all -- entries hold physical addresses, so");
+            println!("  without that mapping there is no virtual address that reaches");
+            println!("  your own page tables.");
+            println!();
+            println!("  Everything after that is this kernel: `map_page` edits the");
+            println!("  tree, every process gets its own level-4 table, fork marks");
+            println!("  entries copy-on-write, and a page that is not present may be");
+            println!("  out on disk rather than absent. Run `pagemap` for the top");
+            println!("  level, or `translate <addr>` to watch one walk happen.");
         },
     },
     Topic {
         keywords: &["memory", "ram", "allocator", "heap", "malloc", "physical"],
         explain: || {
-            println!("MEMORY -- what this kernel does and does not have");
+            println!("MEMORY -- three layers, and they are commonly confused");
             println!();
-            println!("  There is no allocator. None. That is why you will not find a");
-            println!("  String, a Vec, or a Box anywhere in this codebase -- every");
-            println!("  buffer is a fixed-size array decided at compile time.");
+            println!("  Frames. Which 4KiB pieces of physical RAM are free. The free");
+            println!("  list lives inside the free frames themselves, because at that");
+            println!("  point in boot there is nowhere else to put it.");
+            println!();
+            println!("  Mappings. Which virtual address resolves to which frame. That");
+            println!("  is the page tables, and it is a separate question -- a frame");
+            println!("  can be owned and unreachable, or reachable and owned by");
+            println!("  somebody else, which is how you corrupt things.");
+            println!();
+            println!("  The heap. A linked list of holes on top of a mapped range,");
+            println!("  behind Rust's GlobalAlloc. That is the line where Vec, String");
+            println!("  and Box start existing -- run `heap` to see it prove itself.");
             println!();
             println!("  Run `mem` to see the firmware's map. The thing to notice is");
             println!("  that physical RAM is not one clean block: it is a dozen");
@@ -323,10 +341,63 @@ static TOPICS: &[Topic] = &[
             println!("  tables let a kernel hand out one tidy contiguous virtual space");
             println!("  built out of whatever physical scraps are actually available.");
             println!();
-            println!("  Writing an allocator means: track which physical frames are");
-            println!("  free (a bitmap or a free list), map them into virtual space on");
-            println!("  demand, and implement Rust's GlobalAlloc on top. That single");
-            println!("  step is what unlocks String, Vec, and everything built on them.");
+            println!("  When a frame is wanted and none is free, something resident");
+            println!("  is written to disk to make room. Which page goes is a policy");
+            println!("  you can change: `paging` lists them, `bench paging` measures");
+            println!("  what each one costs you.");
+        },
+    },
+    Topic {
+        keywords: &["process", "fork", "exec", "wait", "child", "pid", "address space", "task"],
+        explain: || {
+            let id = crate::task::current_id();
+            let root = crate::memory::active_root();
+            println!("PROCESSES");
+            println!();
+            println!("  You are task {id}, running on the page table at {root:#x}.");
+            println!("  Run `tasks` for the whole table.");
+            println!();
+            println!("  A process here is a task with an address space of its own --");
+            println!("  that is the entire difference, and it is one field. A kernel");
+            println!("  task leaves it empty and runs in the kernel's, which is why the");
+            println!("  scheduler can pick either kind without knowing which it got.");
+            println!();
+            println!("  fork copies no memory. Both sides point at the same frames,");
+            println!("  both lose write permission, and the first one to write takes a");
+            println!("  fault and gets a private copy. Almost every forked program");
+            println!("  replaces itself immediately, so nearly all of that copying");
+            println!("  would have been thrown away unread.");
+            println!();
+            println!("  exec does not make a new process. It is the same task wearing a");
+            println!("  different program -- same id, same parent, same person waiting");
+            println!("  for it. That is why fork plus exec is how a shell starts");
+            println!("  anything, and there is a real one in ring 3 doing it.");
+        },
+    },
+    Topic {
+        keywords: &["schedule", "scheduler", "scheduling", "policy", "preempt", "context switch", "runs next", "priority"],
+        explain: || {
+            let policy = crate::sched::active_name();
+            let ticks = interrupts::ticks();
+            println!("SCHEDULING");
+            println!();
+            println!("  Installed policy: `{policy}`. Ticks so far: {ticks}.");
+            println!();
+            println!("  A task is register values plus a stack, and nothing else. To");
+            println!("  switch, the timer handler saves the registers onto the current");
+            println!("  stack, hands the stack pointer to the scheduler, and uses");
+            println!("  whichever pointer comes back. The strange part is that the");
+            println!("  return does not come back to you -- something else continues,");
+            println!("  and later something returns to you as though no time passed.");
+            println!();
+            println!("  Which task runs next is NOT a fact about this kernel. It is a");
+            println!("  choice, and there are five of them in the tree. `sched` lists");
+            println!("  them and swaps between them while the machine runs.");
+            println!();
+            println!("  Do not take my word for which is better. `bench sched` runs one");
+            println!("  workload under every one and prints the table -- including the");
+            println!("  row where strict priority posts the best interactive latency in");
+            println!("  the list and starves a task anyway.");
         },
     },
     Topic {
@@ -430,9 +501,15 @@ static TOPICS: &[Topic] = &[
             println!("  BIOS left in it and nobody has reprogrammed it. That number is");
             println!("  a 1981 accident: 1.193182 MHz divided by 65536.");
             println!();
-            println!("  This is the kernel's only sense of time. It is far too coarse");
-            println!("  to schedule with -- a real kernel reprograms the PIT to 1000 Hz,");
-            println!("  or better, uses the local APIC timer and the TSC.");
+            println!("  This is the kernel's only sense of time, and it is what the");
+            println!("  scheduler runs on: every tick is a chance to switch tasks. The");
+            println!("  coarseness is visible in the design -- a multi-level queue here");
+            println!("  cannot use a one-tick quantum, because at 55ms per tick");
+            println!("  \"blocked early\" and \"used it all\" are the same measurement.");
+            println!();
+            println!("  A real kernel reprograms the PIT to 1000 Hz, or better, uses");
+            println!("  the local APIC timer and the TSC. There is also no wall clock");
+            println!("  here at all: no date, no seconds since an epoch, just ticks.");
         },
     },
     Topic {
@@ -471,9 +548,10 @@ static TOPICS: &[Topic] = &[
             println!("  almost no setup while the screen needs a framebuffer, a font,");
             println!("  and a glyph rasteriser before it can say one word.");
             println!();
-            println!("  It is also the only way this kernel can reach the outside");
-            println!("  world at all: no network stack, no disk. COM2 is wired to the");
-            println!("  optional host bridge for exactly that reason.");
+            println!("  There is a disk now -- ATA PIO and a FAT16 driver, so `ls`");
+            println!("  and `exec` read real files. There is still no network stack,");
+            println!("  which is why this port is the kernel's only reach beyond the");
+            println!("  machine, and why COM2 is wired to the optional host bridge.");
         },
     },
     Topic {
