@@ -79,7 +79,7 @@ const LOCALITY: [u8; 18] = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2, 5, 1, 2, 6, 1, 2, 7, 1
 /// them to test three-frame behaviour would be a long way round. That is also
 /// what a real kernel does: this is *local* replacement against a fixed
 /// per-process allocation, which is one of the two ways the choice is framed.
-fn run_string(policy: usize, string: &[u8], frames: usize) -> Option<u64> {
+fn run_string(policy: usize, string: &[u8], frames: usize) -> Option<(u64, u64)> {
     crate::replace::install(policy);
 
     let space = memory::AddressSpace::new()?;
@@ -89,6 +89,15 @@ fn run_string(policy: usize, string: &[u8], frames: usize) -> Option<u64> {
 
     let mut faults = 0u64;
     let mut resident = 0usize;
+    // Times the policy was asked for a victim and declined while at the limit.
+    //
+    // This has to be counted or the table lies. A policy that refuses to evict
+    // leaves the resident set above the cap, so every later reference finds its
+    // page still there and the fault count comes out *lower* -- a broken brick
+    // posting the best score in the comparison. Found by deliberately breaking
+    // the clock two ways and watching both come back with six faults where the
+    // working one has nine.
+    let mut refused = 0u64;
 
     interrupts::without_interrupts(|| {
         // The scheduler installs a task's address space on every switch, and
@@ -110,9 +119,12 @@ fn run_string(policy: usize, string: &[u8], frames: usize) -> Option<u64> {
             // At the limit: somebody has to go, and which one is the question
             // this whole module exists to ask.
             if resident >= frames {
-                if let Some(frame) = unsafe { memory::evict_one(root) } {
-                    unsafe { memory::allocator().deallocate(frame) };
-                    resident -= 1;
+                match unsafe { memory::evict_one(root) } {
+                    Some(frame) => {
+                        unsafe { memory::allocator().deallocate(frame) };
+                        resident -= 1;
+                    }
+                    None => refused += 1,
                 }
             }
 
@@ -154,7 +166,7 @@ fn run_string(policy: usize, string: &[u8], frames: usize) -> Option<u64> {
     });
 
     unsafe { memory::AddressSpace::adopt(root).destroy() };
-    Some(faults)
+    Some((faults, refused))
 }
 
 /// Reference a page so the CPU records it.
@@ -194,11 +206,13 @@ pub fn paging() {
     for index in 0..crate::replace::COUNT {
         let three = run_string(index, &BELADY, 3);
         let four = run_string(index, &BELADY, 4);
-        let (Some(three), Some(four)) = (three, four) else {
+        let (Some((three, refused3)), Some((four, refused4))) = (three, four) else {
             println!("    {:<9} out of memory", crate::replace::name_at(index));
             continue;
         };
-        let note = if four > three {
+        let note = if refused3 + refused4 > 0 {
+            "  <- REFUSED to evict; the cap was not held, ignore these"
+        } else if four > three {
             "  <- more memory, MORE faults"
         } else {
             ""
@@ -216,8 +230,10 @@ pub fn paging() {
     for index in 0..crate::replace::COUNT {
         let three = run_string(index, &LOCALITY, 3);
         let four = run_string(index, &LOCALITY, 4);
-        if let (Some(three), Some(four)) = (three, four) {
-            let note = if four > three {
+        if let (Some((three, refused3)), Some((four, refused4))) = (three, four) {
+            let note = if refused3 + refused4 > 0 {
+                "  <- REFUSED to evict; the cap was not held, ignore these"
+            } else if four > three {
                 "  <- more memory, MORE faults"
             } else {
                 ""

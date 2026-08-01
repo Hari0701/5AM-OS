@@ -123,8 +123,10 @@ different and much worse policy: the first few pages of an address space absorb
 every eviction and the rest are never even considered. The position is the only
 state clock has and it exists for exactly this reason.
 
-**Reading the snapshot instead of the entry.** See above. This one does not fail
-loudly.
+**Reading the snapshot instead of the entry.** See above. Like the one-lap
+mistake, this ends with `choose` returning `None` while a page was available —
+so `selftest replace` catches it on "finds the only candidate". What it does
+*not* do is look broken: see the warning below.
 
 **Believing `dirty` will help.** It is real hardware state and it is exposed,
 and in this kernel it is not actionable: there are no file-backed pages, so
@@ -161,6 +163,33 @@ and trade-offs.
 
 Your clock should match the numbers in the table above. If it does not, work out
 which reference behaves differently and why before you change anything.
+
+### Run the conformance suite first, and mean it
+
+This is worth more than the rest of the section, and it was found by doing this
+lab rather than by writing it.
+
+Break the clock two different ways — take away the second lap, or cache the
+accessed bits at the top of `choose` instead of re-reading them — and both
+versions come back from `bench paging` with **six** faults where the working one
+has nine. They look like an improvement.
+
+They are not. Both bugs end with `choose` returning `None` when a page was
+available, so nothing is evicted, so the resident set quietly grows past the
+frame limit, so later references find their pages still there. You have not
+written a better policy. You have written one that declines to do its job and
+scored well because the benchmark let it.
+
+The benchmark now counts refusals and flags the row:
+
+```
+    clock            6         5  <- REFUSED to evict; the cap was not held, ignore these
+```
+
+But the lesson survives the fix, because it generalises: **a measurement you
+have not bounded will reward a component for not participating.** `selftest
+replace` catches both of these instantly, which is why safety runs before
+quality and not after.
 
 ## Going further
 
