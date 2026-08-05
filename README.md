@@ -32,6 +32,47 @@ PRIVILEGE RINGS
 
 ---
 
+## Start here
+
+Four commands, in this order. The first two take five minutes.
+
+```bash
+./run.sh          # boots in about two seconds
+5am> tour         # eight commands, in an order that builds. type what it says.
+5am> bench sched  # five schedulers, one workload, one table
+5am> selftest     # 108 checks, run inside the machine
+```
+
+Then open [exercises/03-heap.md](exercises/03-heap.md) — not lab 1. The heap is
+the smallest thing in here that is genuinely an operating system problem, and it
+depends on nothing else. You delete a working function, write it back, and
+`selftest heap` tells you whether you were right.
+
+**Reading this kernel will teach you less than you expect.** Every hard decision
+in it is already made, correctly, with a comment explaining why — which is
+exactly the problem. Nobody learned the stack-alignment rule from a comment. The
+[nine labs](exercises/) exist because taking the code away is the part that
+works.
+
+### Where things are
+
+| | |
+| --- | --- |
+| [What it does so far](#what-it-does-so-far) | every subsystem, and what each one taught |
+| [The two slots](#the-two-slots) | the scheduler and page replacement are swappable, and measured |
+| [Learning it](#learning-it) | the nine labs |
+| [Layout](#layout) | which file is which |
+| [Known limitations](#known-limitations) | what it honestly cannot do |
+| [About this repository's history](#about-this-repositorys-history) | why the commit dates are what they are |
+
+The chapters between those — [memory](#memory-management),
+[multitasking](#doing-two-things-at-once), [ring 3](#leaving-ring-0),
+[the disk](#a-disk), [fork](#fork), [the neural network](#the-neural-network) —
+are the story of how each piece got built, and the bugs it cost. Read them when
+the corresponding lab stops making sense, not before.
+
+---
+
 ## Running it
 
 Needs Rust nightly and QEMU. Nothing else — no cross-compiler, no linker to

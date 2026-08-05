@@ -80,8 +80,11 @@ pub fn run() -> ! {
 fn banner() {
     println!();
     println!("5AM-OS shell. Everything below reads the live machine.");
-    println!("Type `help`, or `explain <topic>` to learn what is under you.");
-    println!("Type here in this terminal, or in the VM window -- both work.");
+    println!();
+    println!("  New here?  type `tour`   -- eight commands, in an order that builds.");
+    println!("  Otherwise  type `help`   -- all thirty-five, grouped.");
+    println!();
+    println!("Type in this terminal, or in the VM window -- both work.");
     println!();
 }
 
@@ -94,6 +97,7 @@ fn execute(command: &str) {
     match verb {
         "" => {}
         "help" => help(),
+        "tour" => tour(rest.trim()),
         "explain" => explain(rest),
         "regs" => regs(),
         "gdt" => dump_gdt(),
@@ -153,58 +157,238 @@ fn split(input: &str) -> (&str, &str) {
     }
 }
 
+/// One stop on the guided tour.
+struct Stop {
+    command: &'static str,
+    lines: &'static [&'static str],
+}
+
+/// The way in.
+///
+/// There are thirty-five commands in this shell and a newcomer typing `help`
+/// gets all of them at once, which is the same as getting none. This is eight
+/// of them in an order that builds, and it deliberately does not run anything
+/// for you -- you type the command, because typing it is the part that sticks.
+///
+/// The last stop halts the machine on purpose. That is not a bug in the tour.
+static TOUR: &[Stop] = &[
+    Stop {
+        command: "explain rings",
+        lines: &[
+            "Start with where you are. That command reads CS out of the CPU",
+            "and tells you which privilege ring you are standing in.",
+            "",
+            "It will say ring 0. Every program you have ever written ran in",
+            "ring 3, asking a kernel for permission. Right now there is",
+            "nothing above you to ask.",
+        ],
+    },
+    Stop {
+        command: "regs",
+        lines: &[
+            "The control registers, live. CR3 is the physical address of the",
+            "page table tree; CR0 bit 31 is whether paging is on at all.",
+            "",
+            "Reading these from a normal program is an instant fault. This is",
+            "the first thing this machine can show you that your laptop",
+            "cannot.",
+        ],
+    },
+    Stop {
+        command: "translate 0x400000",
+        lines: &[
+            "One address, walked by hand through all four page tables.",
+            "",
+            "0x400000 is where user programs load. From the kernel's own",
+            "address space it is usually not mapped -- and `not mapped` is",
+            "precisely what a page fault means. Try `translate 0x444444440000`",
+            "afterwards, which is the heap, and compare.",
+        ],
+    },
+    Stop {
+        command: "workers",
+        lines: &[
+            "Three tasks share one counter, each holding a semaphore across a",
+            "read, a sleep and a write.",
+            "",
+            "Watch the interleaving. Without the semaphore the read-modify-",
+            "write is three steps with a preemption point between each, and",
+            "the total comes out wrong in a way that depends on timing.",
+            "Nine increments, nine results, or the lock is not working.",
+        ],
+    },
+    Stop {
+        command: "bench sched",
+        lines: &[
+            "This is the one to slow down for. Five scheduling policies, one",
+            "workload, one table. Takes about half a minute.",
+            "",
+            "Read the `prio` row. It has the BEST interactive latency in the",
+            "table and it starves a task anyway. Starvation is not a scheduler",
+            "being bad at scheduling -- strict priority is excellent at serving",
+            "what you declared important. It simply has no floor.",
+            "",
+            "Then `sched mlfq` and run it again. You just changed how the",
+            "machine decides what runs next, while it was running.",
+        ],
+    },
+    Stop {
+        command: "bench paging",
+        lines: &[
+            "The same idea for memory, and one row worth the whole detour.",
+            "",
+            "`fifo` takes NINE faults with three frames and TEN with four. The",
+            "machine was given more memory and did more work. Belady found",
+            "that in 1969 and it is still the most surprising true thing in",
+            "the subject -- and those are real pages, real accessed bits, real",
+            "writes to the disk.",
+        ],
+    },
+    Stop {
+        command: "selftest",
+        lines: &[
+            "108 checks, run inside the machine, because that is the only",
+            "honest place. Your laptop can verify an ELF header parses. It",
+            "cannot take a page fault or switch a stack.",
+            "",
+            "`selftest claims` is the odd one: it tests what this repository",
+            "SAYS about itself, because the README lied about six things for",
+            "a month and no test could catch a sentence.",
+        ],
+    },
+    Stop {
+        command: "fault stack",
+        lines: &[
+            "Last one, and it ends the machine on purpose. Ctrl-A then X to",
+            "quit afterwards, then ./run.sh again.",
+            "",
+            "It recurses until the kernel stack runs out. That faults. Faulting",
+            "while handling a fault is a double fault -- and without a known-",
+            "good stack to land on, that becomes a triple fault, which is not",
+            "an exception at all. It is the CPU giving up and resetting the",
+            "machine with nothing printed.",
+            "",
+            "You are about to watch this one survive it and tell you why.",
+        ],
+    },
+];
+
+static mut TOUR_STEP: usize = 0;
+
+fn tour(argument: &str) {
+    let step = match argument.trim() {
+        "" => unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TOUR_STEP)) },
+        "reset" | "restart" => {
+            unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(TOUR_STEP), 0) };
+            0
+        }
+        text => match text.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= TOUR.len() => n - 1,
+            _ => {
+                println!("  usage: tour            the next stop");
+                println!("         tour <1..{}>    jump to one", TOUR.len());
+                println!("         tour reset     start over");
+                return;
+            }
+        },
+    };
+
+    if step >= TOUR.len() {
+        println!();
+        println!("  That is the tour. What you have not seen yet is the part that");
+        println!("  actually teaches: reading this kernel will not do it. Every hard");
+        println!("  decision in here is already made, correctly, with a comment");
+        println!("  saying why -- which is exactly the problem.");
+        println!();
+        println!("  So there are nine labs in exercises/. Each one deletes a working");
+        println!("  function and asks for it back, and `selftest` tells you whether");
+        println!("  you were right.");
+        println!();
+        println!("  Start with exercises/03-heap.md. Not lab 1 -- the heap is the");
+        println!("  smallest thing here that is genuinely an operating system");
+        println!("  problem, and it depends on nothing else.");
+        println!();
+        println!("  `tour reset` to go round again.");
+        println!();
+        return;
+    }
+
+    let stop = &TOUR[step];
+    println!();
+    println!("  [{} of {}]   type:  {}", step + 1, TOUR.len(), stop.command);
+    println!();
+    for line in stop.lines {
+        if line.is_empty() {
+            println!();
+        } else {
+            println!("  {line}");
+        }
+    }
+    println!();
+    if step + 1 < TOUR.len() {
+        println!("  then `tour` for the next one.");
+    } else {
+        println!("  then `tour` for what to do next.");
+    }
+    println!();
+
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(TOUR_STEP), step + 1) };
+}
+
 fn help() {
-    println!("commands:");
-    println!("  help              this list");
-    println!("  explain <topic>   read the machine and explain a subsystem");
-    println!("                    topics: boot gdt idt interrupts paging");
-    println!("                            rings serial keyboard");
+    println!("  new here?  type `tour`  -- eight commands, in an order that builds.");
+    println!();
+    println!("ASK IT THINGS");
+    println!("  explain <topic>   read the live machine and explain a subsystem:");
+    println!("                    boot gdt idt interrupts paging rings serial");
+    println!("                    keyboard");
+    println!("  ask <question>    answered inside this machine -- keyword matching");
+    println!("                    plus hardware decoders. no network, no model.");
+    println!("  bridge <question> send it out over COM2 to a host process instead");
+    println!("                    (optional, needs bridge.py)");
+    println!();
+    println!("LOOK AT THE MACHINE");
     println!("  regs              live control registers");
-    println!("  gdt               decode every GDT entry");
-    println!("  idt               which interrupt vectors are wired up");
+    println!("  gdt / idt         decode the descriptor tables the CPU is using");
     println!("  mem               physical memory map from the firmware");
-    println!("  uptime            timer ticks since boot");
-    println!("  fpu               is floating point on, and does it work?");
-    println!("  screen            the framebuffer this text is drawn on");
+    println!("  pagemap           which 512 GiB slots of the address space exist");
+    println!("  translate <addr>  walk the page tables for one address");
     println!("  heap              the allocator, proved with a live Vec");
     println!("  tasks             what is running, and how often it switched");
-    println!("  sched [policy]    show, or swap, how the machine decides what");
-    println!("                    runs next: rr | fifo | prio | aging | mlfq");
-    println!("  paging [policy]   show, or swap, which page leaves memory when");
-    println!("                    one has to: clock | fifo | nru | random");
-    println!("  bench sched [n]   run one workload under every policy and print");
-    println!("                    the comparison. this is the argument, settled.");
-    println!("  bench paging      every page replacement policy, and Belady's");
-    println!("                    anomaly reproduced on real page tables");
-    println!("  timeline [n]      draw the last n ticks: who ran, and who was");
-    println!("                    runnable and passed over");
-    println!("  spawn <prompt>    run the transformer in the background and");
-    println!("                    keep using the shell while it thinks");
-    println!("  user              drop to ring 3 and come back through a");
-    println!("                    syscall -- the privilege boundary, live");
-    println!("  selftest [suite]  run the kernel's tests against itself");
-    println!("                    suites: heap memory space cow swap pipe sync sched policy replace priority elf fat claims");
+    println!("  uptime / fpu / screen");
+    println!();
+    println!("CHANGE HOW IT DECIDES");
+    println!("  sched [policy]    what runs next: rr fifo prio aging mlfq");
+    println!("  paging [policy]   what leaves memory: clock fifo nru random");
+    println!();
+    println!("MEASURE IT");
+    println!("  bench sched [n]   one workload under every scheduling policy");
+    println!("  bench paging      every replacement policy, and Belady's anomaly");
+    println!("  timeline [n]      who ran, and who was runnable and passed over");
+    println!("  selftest [suite]  108 checks, run inside the machine");
+    println!("                    heap memory space cow swap pipe sync sched");
+    println!("                    policy replace priority elf fat claims");
+    println!();
+    println!("MAKE IT DO SOMETHING");
     println!("  workers           three tasks share one semaphore, visibly");
     println!("  ticker            a kernel task that prints while other things run");
-    println!("  sleep <ticks>     block this shell on the clock, not a spin");
-    println!("  ls                list the files on the FAT16 disk");
-    println!("  cat <file>        print a file from that disk");
-    println!("  write <file> <..> create or replace a file, for real");
-    println!("  rm <file>         delete one");
+    println!("  user              drop to ring 3 and come back through a syscall");
     println!("  exec <file>       load an ELF off the disk and run it in ring 3");
-    println!("  translate <addr>  walk the page tables for an address");
-    println!("  pagemap           which 512 GiB slots of the address space exist");
-    println!("  smp <step>        bring up a second processor, one step at a time");
-    println!("                    steps: apic | install | wake");
-    println!("  model             what neural network is loaded, if any");
-    println!("  llm <prompt>      run that network. It writes stories; it does");
-    println!("                    NOT know anything about this kernel.");
-    println!("  fault <kind>      deliberately break something:");
-    println!("                    int3 | div0 | page | null | wild | stack");
-    println!("  ask <question>    ask the kernel about itself. Answered inside");
-    println!("                    this machine -- no network, no host process.");
-    println!("  bridge <question> send the question out over COM2 to a host");
-    println!("                    process instead (optional, needs bridge.py)");
+    println!("  sleep <ticks>     block this shell on the clock, not a spin");
+    println!("  smp <step>        wake a second processor: apic | install | wake");
+    println!();
+    println!("THE DISK");
+    println!("  ls / cat <file> / write <file> <..> / rm <file>");
+    println!();
+    println!("BREAK IT ON PURPOSE");
+    println!("  fault <kind>      int3 | div0 | page | null | wild | stack");
+    println!();
+    println!("THE NEURAL NETWORK  (needs ./run.sh --ai)");
+    println!("  model             what is loaded, if anything");
+    println!("  llm <prompt>      run it. It writes stories. It does NOT know");
+    println!("                    anything about this kernel.");
+    println!("  spawn <prompt>    same, on its own task, so the shell stays yours");
+    println!();
     println!("  clear             clear the screen");
 }
 
