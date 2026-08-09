@@ -46,11 +46,11 @@ one at the lowest priority — under every policy, and prints what happened:
 
 ```
   policy  switches  fairness  worst wait  inter wait  first CPU  starved  bg slices
-  rr            66  0.9981           3           3          3        0         15
-  fifo           8  0.2754          65          63         64        3          1
-  prio          67  0.7596          66           2          3        1          1
-  aging         67  0.8858          10           4          3        0          7
-  mlfq          24  0.9796           5           2          5        0          6
+  rr            94  0.9997           3           3          3        0         23
+  fifo           8  0.2668          95          93         94        3          1
+  prio          95  0.7428          93           2          3        1          1
+  aging         97  0.8779          10           4          3        0         10
+  mlfq          34  0.9758           5           2          5        0          9
 ```
 
 Read the rows before you read any further. Four claims that every operating
@@ -145,17 +145,28 @@ doing underneath.
 
 ## Where people go wrong
 
-**Leaving out rule 5.** Rules 1–4 alone are `prio` with extra steps: long-running
-work sinks to the bottom and stays there forever, including work that did
-nothing wrong. Write it without the boost first, run `bench sched`, and watch
-`bg slices` collapse and `starved` go to 1. Then add the boost. Doing it in that
-order is worth more than getting it right the first time.
+**Leaving out rule 5.** Rules 1–4 alone let long-running work sink to the bottom
+and stay there, including work that did nothing wrong. Write it without the
+boost first, run `bench sched`, and compare — measured here, fairness fell from
+0.976 to 0.888, worst wait doubled from 5 to 9, and the background task lost a
+third of its slices. Then add the boost.
 
-**A one-tick quantum at the top level.** The timer here runs at the PIT's
-default ~18.2 Hz, and that is the finest thing this kernel can see. With a
-quantum of one tick, "blocked early" and "used it all" are the same
-measurement — so rule 3 demotes exactly the tasks rule 4 exists to protect, and
-your interactive task sinks. Start the quanta at 2 and double with depth.
+Note what does *not* happen: `starved` stays 0. Ninety ticks is not long enough
+for anyone to cross the 40-tick threshold under this workload, so the column you
+might expect to catch it does not. The damage is real and it shows up in
+fairness and worst-wait instead. A measurement that does not move is not the
+same as a policy that is fine.
+
+**A one-tick quantum at the top level.** The timer runs at the PIT's default
+~18.2 Hz, the finest thing this kernel can see. With a one-tick quantum,
+"blocked early" and "used it all" are the same measurement.
+
+Measured, this one is subtler than it sounds: interactive wait only slipped from
+2 to 3, and first-CPU actually improved. What really happened is that the policy
+stopped being MLFQ at all — switches jumped 34 → 52 and fairness climbed to
+0.9988, which is round robin's 0.9997 in all but name. **The growing quantum is
+the entire difference between a multi-level queue and round robin with extra
+bookkeeping.** Start at 2 and double with depth.
 
 **Keeping state on `Task`.** It will work, and it will be the wrong shape, and
 you will find out when you write your second brick.
@@ -199,9 +210,15 @@ hang your machine, and it is supposed to. Conformance is safety: get it wrong
 and the scheduler resumes a stack belonging to nobody. Quality is a trade-off
 you measure and then argue about.
 
-Your target is the `mlfq` row: around 24 switches, fairness above 0.95, worst
-wait in single digits, interactive wait of 2, nothing starved. You do not have
-to match it. You have to be able to say why your numbers differ.
+**Record your own baseline before you delete anything.** Run `bench sched` on
+the working kernel and write the `mlfq` row down. The absolute numbers in this
+document drifted once already — they were measured before an unrelated change to
+how the mechanism counts idle ticks, and every figure in the table moved. What
+did not move was the shape: `prio` best at latency and starving somebody, `mlfq`
+matching it at a third of the switches with nobody starved.
+
+So compare against *your* baseline, not against the printed one. If your version
+has the same shape, you have written a multi-level feedback queue.
 
 ## Do not trust the first table
 

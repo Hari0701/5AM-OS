@@ -1325,12 +1325,15 @@ slice — none of that is recoverable from "who is runnable right now".
 5am> bench sched
 
   policy  switches  fairness  worst wait  inter wait  starved  bg slices
-  rr            66  0.9981           3           3        0         15
-  fifo           8  0.2754          65          63        3          1
-  prio          67  0.7596          66           2        1          1
-  aging         67  0.8858          10           4        0          7
-  mlfq          24  0.9796           5           2        0          6
+  rr            94  0.9997           3           3        0         23
+  fifo           8  0.2668          95          93        3          1
+  prio          95  0.7428          93           2        1          1
+  aging         97  0.8779          10           4        0         10
+  mlfq          34  0.9758           5           2        0          9
 ```
+
+These digits move when unrelated parts of the kernel change — run it yourself
+rather than trusting the snapshot. The *shape* is what holds.
 
 `prio` has the **best** interactive latency in that table and starves a task
 anyway. That row is worth sitting with, because it refutes the intuition that
